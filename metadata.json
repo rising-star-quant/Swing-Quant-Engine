@@ -1,0 +1,6 @@
+{
+  "name": "Swing Quant Engine — Bootstrap & Architecture Studio",
+  "description": "Autonomous Multi-Index Swing Quant Engine (López de Prado Triple-Barrier, Meta-Labeling & Simons Zero-Override Architecture) repository bootstrapper and interactive quantitative verification workbench.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

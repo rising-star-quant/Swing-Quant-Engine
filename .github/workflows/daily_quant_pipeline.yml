@@ -1,0 +1,119 @@
+name: Autonomous Swing Quant Engine (EOD Pipeline)
+
+on:
+  schedule:
+    # Runs at 21:45 UTC Monday through Friday (Post-US Market Settlement)
+    - cron: "45 21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      as_of_date:
+        description: "Optional target EOD date (YYYY-MM-DD). Leave blank for today UTC."
+        required: false
+        default: ""
+      user_id:
+        description: "Target tenant user_id UUID or 'default'"
+        required: false
+        default: "default"
+      dry_run:
+        description: "Run pipeline in dry-run mode without committing state changes"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: swing-quant-engine-eod-state-lock
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  QUANT_ENV: "production"
+  LOG_LEVEL: "INFO"
+  STATE_STORE_PATH: "data/portfolios/virtual_portfolio_default.json"
+  PARQUET_CACHE_PATH: "data/cache/market_data_window.parquet"
+  CONSTITUENTS_DIR: "config/constituents"
+  INDEX_REGISTRY_PATH: "config/index_registry.json"
+
+jobs:
+  execute-quant-cycle:
+    name: EOD Screening, Triple-Barrier & Portfolio Sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set Up Python ${{ env.PYTHON_VERSION }} with Pip Cache
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: Install Locked Production & Verification Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute Pre-Flight Pytest Verification Suite
+        run: pytest tests/test_quant_engine.py -v --tb=short
+
+      - name: Restore 500-Day Rolling Market Data Parquet Cache
+        uses: actions/cache@v4
+        with:
+          path: data/cache
+          key: parquet-sliding-window-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            parquet-sliding-window-${{ runner.os }}-
+
+      - name: Run Autonomous Swing Quant Engine Cycle
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
+        run: |
+          CMD="python src/main.py --user-id ${{ github.event.inputs.user_id || 'default' }}"
+          if [ -n "${{ github.event.inputs.as_of_date }}" ]; then
+            CMD="$CMD --as-of-date ${{ github.event.inputs.as_of_date }}"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            CMD="$CMD --dry-run"
+          fi
+          echo "Executing: $CMD"
+          $CMD
+
+      - name: Commit Updated Multi-Tenant Portfolio Ledger
+        if: ${{ success() && github.event.inputs.dry_run != 'true' }}
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ env.STATE_STORE_PATH }}"
+
+          if git diff --staged --quiet; then
+            echo "No portfolio state changes detected for today's session."
+          else
+            RUN_DATE=$(date -u +"%Y-%m-%d")
+            git commit -m "chore(state): automated EOD portfolio ledger sync (${RUN_DATE}) [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push origin HEAD:"${GITHUB_REF_NAME}"
+            echo "Successfully committed and pushed updated portfolio ledger."
+          fi
+
+      - name: Dispatch Pipeline Failure Alert to Telegram
+        if: ${{ failure() }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              -d parse_mode="HTML" \
+              -d text="🚨 <b>CRITICAL: Swing Quant Engine Pipeline Failed</b>%0A<b>Run ID:</b> <code>${{ github.run_id }}</code>%0A<b>Commit:</b> <code>${{ github.sha }}</code>%0A<i>Zero-Override Protection: Portfolio state was NOT modified.</i>" > /dev/null
+          fi

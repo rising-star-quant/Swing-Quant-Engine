@@ -1,0 +1,16 @@
+{
+  "portfolio_id": "00000000-0000-4000-8000-000000000101",
+  "user_id": "00000000-0000-4000-8000-000000000001",
+  "portfolio_name": "Primary Swing Shadow Portfolio",
+  "as_of_date": "2026-11-11",
+  "cash_balance": 100000.0,
+  "total_equity": 100000.0,
+  "max_portfolio_heat_pct": 0.06,
+  "max_concurrent_positions": 10,
+  "subscribed_indices": [
+    "RUT",
+    "MID"
+  ],
+  "open_positions": {},
+  "closed_trades_audit": []
+}

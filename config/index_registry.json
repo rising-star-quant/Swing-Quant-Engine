@@ -1,0 +1,30 @@
+{
+  "RUT": {
+    "index_id": "RUT",
+    "display_name": "Russell 2000 Small-Cap",
+    "benchmark_ticker": "IWM",
+    "tier": "SMALL_CAP",
+    "is_active": true,
+    "min_price": 5.0,
+    "min_adv_30d": 500000,
+    "max_relative_spread": 0.005,
+    "volume_surge_multiplier": 1.8,
+    "k_stop_atr": 2.5,
+    "k_profit_atr": 5.0,
+    "max_holding_bars": 14
+  },
+  "MID": {
+    "index_id": "MID",
+    "display_name": "S&P MidCap 400",
+    "benchmark_ticker": "MDY",
+    "tier": "MID_CAP",
+    "is_active": true,
+    "min_price": 5.0,
+    "min_adv_30d": 500000,
+    "max_relative_spread": 0.004,
+    "volume_surge_multiplier": 1.4,
+    "k_stop_atr": 2.0,
+    "k_profit_atr": 4.5,
+    "max_holding_bars": 14
+  }
+}
