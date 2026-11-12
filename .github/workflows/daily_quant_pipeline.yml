@@ -54,6 +54,8 @@ jobs:
           ENVIRONMENT: test
           DRY_RUN: 'true'
         run: |
+      - name: Gate 0 — Pre-Flight System Integrity Audit
+        run: python scripts/verify_system.py
           pytest -v --tb=short
 
       - name: Gate 2 — Autonomous Daily EOD Execution
