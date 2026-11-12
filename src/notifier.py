@@ -1,26 +1,61 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import date
 import html
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
-from config import EngineSettings
-from schemas import (
-    ClosedTradeAuditSchema,
-    ExitReason,
-    MetaLabeledSignalSchema,
-    TripleBarrierPositionSchema,
-    VirtualPortfolioLedgerSchema,
-)
+try:
+    from src.config import SystemSettings, get_settings
+    from src.schemas import (
+        ClosedTradeAuditSchema,
+        ExitReason,
+        MetaLabeledSignalSchema,
+        TripleBarrierPositionSchema,
+        VirtualPortfolioLedgerSchema,
+    )
+except ImportError:
+    from config import SystemSettings, get_settings  # type: ignore[no-redef]
+    from schemas import (  # type: ignore[no-redef]
+        ClosedTradeAuditSchema,
+        ExitReason,
+        MetaLabeledSignalSchema,
+        TripleBarrierPositionSchema,
+        VirtualPortfolioLedgerSchema,
+    )
 
 logger = logging.getLogger("SwingQuantEngine.Notifier")
 
 
-class TelegramDispatchService:
+def _unwrap_secret(secret_val: Any) -> str:
+    if secret_val is None:
+        return ""
+    if hasattr(secret_val, "get_secret_value"):
+        return str(secret_val.get_secret_value()).strip()
+    return str(secret_val).strip()
+
+
+@dataclass(frozen=True)
+class TenantDailyReportPayload:
+    """
+    Immutable telemetry payload encapsulating a single tenant's EOD portfolio state,
+    newly allocated positions, closed Triple-Barrier trades, and approved/vetoed signals.
+    """
+
+    as_of_date: date
+    ledger: VirtualPortfolioLedgerSchema
+    opened_positions: List[TripleBarrierPositionSchema] = field(default_factory=list)
+    closed_trades: List[ClosedTradeAuditSchema] = field(default_factory=list)
+    approved_signals: List[MetaLabeledSignalSchema] = field(default_factory=list)
+    vetoed_signals: List[MetaLabeledSignalSchema] = field(default_factory=list)
+    dry_run: bool = False
+
+
+class TelegramNotifier:
     """
     Resilient, multi-tenant HTML telemetry dispatcher for the Telegram Bot API
     built on httpx. Enforces HTML entity escaping, line-aware 4,096-character
@@ -32,23 +67,53 @@ class TelegramDispatchService:
 
     def __init__(
         self,
-        settings: EngineSettings,
+        settings: Optional[SystemSettings] = None,
         max_retries: int = 3,
         base_backoff_sec: float = 2.0,
         request_timeout_sec: float = 10.0,
     ) -> None:
-        self.settings = settings
+        self.settings: SystemSettings = settings or get_settings()
         self.max_retries = max_retries
         self.base_backoff_sec = base_backoff_sec
         self.request_timeout_sec = request_timeout_sec
 
     @property
     def is_configured(self) -> bool:
-        return bool(
-            self.settings.telegram_bot_token is not None
-            and self.settings.telegram_chat_id is not None
-            and self.settings.telegram_bot_token.get_secret_value().strip()
-            and self.settings.telegram_chat_id.get_secret_value().strip()
+        token = _unwrap_secret(getattr(self.settings, "telegram_bot_token", None))
+        chat_id = _unwrap_secret(getattr(self.settings, "telegram_chat_id", None))
+        return bool(token and chat_id)
+
+    def dispatch_tenant_report(
+        self,
+        payload: TenantDailyReportPayload,
+        tenant_chat_id_override: Optional[str] = None,
+    ) -> bool:
+        """
+        Formats and dispatches a `TenantDailyReportPayload` to Telegram.
+        """
+        return self.dispatch_tenant_daily_report(
+            portfolio=payload.ledger,
+            opened_positions=payload.opened_positions,
+            closed_trades=payload.closed_trades,
+            approved_signals=payload.approved_signals,
+            as_of_date=payload.as_of_date,
+            dry_run=payload.dry_run,
+            tenant_chat_id_override=tenant_chat_id_override,
+        )
+
+    def dispatch_critical_alert(
+        self,
+        error_message: str,
+        stage: str = "QuantPipelineOrchestrator",
+        as_of_date: Optional[date] = None,
+    ) -> bool:
+        """
+        Dispatches an urgent operational circuit-breaker alert to Telegram.
+        """
+        return self.dispatch_system_circuit_breaker_alert(
+            stage=stage,
+            error_summary=error_message,
+            as_of_date=as_of_date,
         )
 
     def dispatch_tenant_daily_report(
@@ -62,7 +127,7 @@ class TelegramDispatchService:
         tenant_chat_id_override: Optional[str] = None,
     ) -> bool:
         if not self.is_configured and not tenant_chat_id_override:
-            logger.warning(
+            logger.info(
                 "Telegram credentials not configured; skipping EOD telemetry dispatch."
             )
             return False
@@ -70,7 +135,7 @@ class TelegramDispatchService:
         target_chat_id = (
             tenant_chat_id_override
             if tenant_chat_id_override
-            else self.settings.telegram_chat_id.get_secret_value()  # type: ignore[union-attr]
+            else _unwrap_secret(getattr(self.settings, "telegram_chat_id", None))
         )
 
         report_html = self.format_daily_portfolio_report_html(
@@ -107,7 +172,7 @@ class TelegramDispatchService:
         if not self.is_configured:
             return False
 
-        target_chat_id = self.settings.telegram_chat_id.get_secret_value()  # type: ignore[union-attr]
+        target_chat_id = _unwrap_secret(getattr(self.settings, "telegram_chat_id", None))
         dt_str = as_of_date.isoformat() if as_of_date else "N/A"
         safe_stage = html.escape(stage)
         safe_err = html.escape(error_summary[:1200])
@@ -242,7 +307,10 @@ class TelegramDispatchService:
         return chunks
 
     def _send_html_payload(self, chat_id: str, text: str) -> bool:
-        token = self.settings.telegram_bot_token.get_secret_value()  # type: ignore[union-attr]
+        token = _unwrap_secret(getattr(self.settings, "telegram_bot_token", None))
+        if not token or not chat_id:
+            return False
+
         url = f"{self.TELEGRAM_API_BASE}/bot{token}/sendMessage"
         payload = {
             "chat_id": chat_id,
@@ -262,7 +330,7 @@ class TelegramDispatchService:
                         retry_after = int(
                             response.json()
                             .get("parameters", {})
-                            .get("retry_after", self.base_backoff_sec ** attempt)
+                            .get("retry_after", self.base_backoff_sec**attempt)
                         )
                         logger.warning(
                             f"Telegram API rate limit hit (HTTP 429). Waiting {retry_after}s before retry..."
@@ -280,7 +348,10 @@ class TelegramDispatchService:
                     )
 
                 if attempt < self.max_retries:
-                    time.sleep(self.base_backoff_sec ** attempt)
+                    time.sleep(self.base_backoff_sec**attempt)
 
         logger.error("Exhausted all Telegram dispatch retries. Continuing without crashing.")
         return False
+
+
+TelegramDispatchService = TelegramNotifier
