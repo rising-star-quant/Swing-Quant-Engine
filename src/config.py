@@ -2,14 +2,19 @@ from __future__ import annotations
 
 from functools import lru_cache
 import json
-import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from src.schemas import IndexConfigSchema
+try:
+    from src.schemas import IndexConfigSchema
+except ImportError:
+    from schemas import IndexConfigSchema  # type: ignore[no-redef]
+
+
+DEFAULT_SANDBOX_JWT_SECRET = "SANDBOX_DEFAULT_JWT_SECRET_KEY_MIN_32_CHARS_LONG!"
 
 
 class SystemSettings(BaseSettings):
@@ -129,7 +134,7 @@ class SystemSettings(BaseSettings):
 
     # Multi-Tenant Security & Future Cloud Migration (Argon2id / JWT / Supabase)
     jwt_secret_key: str = Field(
-        default="CHANGE_ME_IN_PRODUCTION_MIN_32_CHARS_LONG!",
+        default=DEFAULT_SANDBOX_JWT_SECRET,
         min_length=32,
         description="Cryptographic secret key for HS256 JWT validation.",
     )
@@ -152,11 +157,52 @@ class SystemSettings(BaseSettings):
         description="Supabase service role secret key.",
     )
 
+    @field_validator("jwt_secret_key", mode="before")
+    @classmethod
+    def coerce_empty_jwt_secret_key(cls, v: Any) -> Any:
+        """
+        Coerces unset or empty-string CI environment variables (e.g., JWT_SECRET_KEY="")
+        to a valid 32+ character sandbox default key so sandbox/test runs never crash,
+        while production enforcement is handled by the model_validator.
+        """
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return DEFAULT_SANDBOX_JWT_SECRET
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator(
+        "telegram_bot_token",
+        "telegram_chat_id",
+        "supabase_url",
+        "supabase_service_key",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_empty_strings(cls, v: Any) -> Optional[str]:
+        """
+        Normalizes empty or whitespace-only environment variables to None.
+        """
+        if v is None:
+            return None
+        if isinstance(v, str):
+            stripped = v.strip()
+            return stripped if stripped else None
+        return str(v)
+
     @model_validator(mode="after")
-    def resolve_paths_and_create_directories(self) -> SystemSettings:
+    def resolve_paths_and_enforce_production_secrets(self) -> SystemSettings:
         """
-        Resolves relative paths against base_dir and ensures target directories exist.
+        1. Enforces that production environments never run with default/placeholder JWT keys.
+        2. Resolves relative paths against base_dir and ensures target directories exist.
         """
+        if self.environment == "production":
+            upper_secret = self.jwt_secret_key.upper()
+            if "SANDBOX_DEFAULT" in upper_secret or "CHANGE_ME" in upper_secret:
+                raise ValueError(
+                    "CRITICAL SECURITY VIOLATION: Production environment requires a strong, "
+                    "non-default JWT_SECRET_KEY (>= 32 characters). Default or placeholder keys "
+                    "('SANDBOX_DEFAULT' / 'CHANGE_ME') are strictly prohibited in production."
+                )
+
         # Resolve index_registry_path
         if not self.index_registry_path.is_absolute():
             object.__setattr__(
