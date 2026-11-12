@@ -55,6 +55,169 @@ class TenantDailyReportPayload:
     dry_run: bool = False
 
 
+class TelegramHTMLFormatter:
+    """
+    Pure HTML formatter and line-aware message chunker for Telegram Bot API
+    (`parse_mode="HTML"`), guaranteeing safe entity escaping and <= 4,000-char payloads.
+    """
+
+    MAX_MESSAGE_LENGTH = 4000
+
+    @staticmethod
+    def format_exit_reason_badge(reason: ExitReason) -> str:
+        if reason == ExitReason.UPPER_BARRIER_TP:
+            return "✅ <b>TAKE-PROFIT BARRIER</b>"
+        if reason == ExitReason.LOWER_BARRIER_SL:
+            return "🛑 <b>TRAILING STOP BARRIER</b>"
+        if reason == ExitReason.VERTICAL_BARRIER_TIME:
+            return "⏱️ <b>14-DAY TIME BARRIER</b>"
+        return "⚠️ <b>CIRCUIT BREAKER EXIT</b>"
+
+    @classmethod
+    def format_tenant_report(cls, payload: TenantDailyReportPayload) -> List[str]:
+        """
+        Formats a `TenantDailyReportPayload` into one or more line-broken HTML chunks.
+        """
+        full_html = cls.format_daily_portfolio_report_html(
+            portfolio=payload.ledger,
+            opened_positions=payload.opened_positions,
+            closed_trades=payload.closed_trades,
+            approved_signals=payload.approved_signals,
+            as_of_date=payload.as_of_date,
+            dry_run=payload.dry_run,
+        )
+        return cls.chunk_html_message(full_html, max_length=cls.MAX_MESSAGE_LENGTH)
+
+    @classmethod
+    def format_daily_portfolio_report_html(
+        cls,
+        portfolio: VirtualPortfolioLedgerSchema,
+        opened_positions: List[TripleBarrierPositionSchema],
+        closed_trades: List[ClosedTradeAuditSchema],
+        approved_signals: List[MetaLabeledSignalSchema],
+        as_of_date: date,
+        dry_run: bool = False,
+    ) -> str:
+        mode_badge = "🧪 SANDBOX DRY-RUN" if dry_run else "⚡ EOD PRODUCTION LEDGER"
+        safe_name = html.escape(portfolio.portfolio_name)
+        heat_pct = portfolio.current_portfolio_heat_pct * 100.0
+        max_heat_pct = portfolio.max_portfolio_heat_pct * 100.0
+
+        lines: List[str] = [
+            f"🏛️ <b>SWING QUANT ENGINE | {mode_badge}</b>",
+            f"<b>Portfolio:</b> {safe_name} (<code>{str(portfolio.portfolio_id)[:8]}</code>)",
+            f"<b>Tenant User:</b> <code>{str(portfolio.user_id)[:8]}</code>",
+            f"<b>Market Date:</b> <code>{as_of_date.isoformat()}</code>",
+            "━━━━━━━━━━━━━━━━━━",
+            "📊 <b>EXECUTIVE PORTFOLIO TELEMETRY</b>",
+            f"• <b>Total Equity:</b> <code>${portfolio.total_equity:,.2f}</code>",
+            f"• <b>Cash Balance:</b> <code>${portfolio.cash_balance:,.2f}</code>",
+            f"• <b>Active Capacity:</b> <code>{len(portfolio.open_positions)} / {portfolio.max_concurrent_positions} Slots</code>",
+            f"• <b>Portfolio Heat:</b> <code>{heat_pct:.2f}% / {max_heat_pct:.2f}% Max</code>",
+            "━━━━━━━━━━━━━━━━━━",
+        ]
+
+        lines.append(f"🎯 <b>TRIPLE-BARRIER EXITS ({len(closed_trades)})</b>")
+        if not closed_trades:
+            lines.append("<i>No barrier exits triggered during today's session.</i>")
+        else:
+            for trade in closed_trades:
+                badge = cls.format_exit_reason_badge(trade.exit_reason)
+                pnl_sign = "+" if trade.realized_pnl_dollars >= 0 else ""
+                r_sign = "+" if trade.realized_r_multiple >= 0 else ""
+                lines.append(
+                    f"• <b>{html.escape(trade.ticker)}</b> [{html.escape(trade.index_id)}] — {badge}\n"
+                    f"  Exit: <code>${trade.exit_price:,.2f}</code> (Entry: <code>${trade.entry_price:,.2f}</code> | Held: <code>{trade.bars_held}d</code>)\n"
+                    f"  Realized: <code>{pnl_sign}${trade.realized_pnl_dollars:,.2f}</code> (<b>{r_sign}{trade.realized_r_multiple:.2f}R</b>)"
+                )
+        lines.append("━━━━━━━━━━━━━━━━━━")
+
+        lines.append(f"🚀 <b>NEW META-LABELED ENTRIES ({len(opened_positions)})</b>")
+        if not opened_positions:
+            lines.append("<i>No new positions allocated (filtered by Meta-Labeling or Heat Gate).</i>")
+        else:
+            sig_lookup: Dict[str, MetaLabeledSignalSchema] = {
+                s.primary_signal.ticker: s for s in approved_signals
+            }
+            for pos in opened_positions:
+                meta_info = sig_lookup.get(pos.ticker)
+                score_str = (
+                    f"Score: {meta_info.primary_signal.primary_score:.1f} | "
+                    f"φ: {meta_info.meta_conviction_scalar:.2f}x | "
+                    f"EV: +{meta_info.historical_ev_r_multiple:.2f}R"
+                    if meta_info
+                    else "Meta-Validated"
+                )
+                notional = pos.shares * pos.entry_price
+                lines.append(
+                    f"• <b>{html.escape(pos.ticker)}</b> [{html.escape(pos.index_id)}] — <code>{pos.shares} sh</code> @ <code>${pos.entry_price:,.2f}</code> (<code>${notional:,.0f}</code>)\n"
+                    f"  <i>{score_str}</i>\n"
+                    f"  Cage: SL <code>${pos.initial_stop_price:,.2f}</code> | TP <code>${pos.take_profit_price:,.2f}</code> | Max <code>{pos.max_holding_bars}d</code>"
+                )
+        lines.append("━━━━━━━━━━━━━━━━━━")
+
+        lines.append(f"🛡️ <b>ACTIVE TRIPLE-BARRIER BOOK ({len(portfolio.open_positions)})</b>")
+        if not portfolio.open_positions:
+            lines.append("<i>Portfolio is currently 100% in cash.</i>")
+        else:
+            for ticker, pos in sorted(portfolio.open_positions.items()):
+                locked_profit_flag = (
+                    "🔒 <i>(Risk-Free / Stop >= Entry)</i>"
+                    if pos.trailing_stop_price >= pos.entry_price
+                    else f"Open Risk: <code>${pos.open_dollar_risk:,.0f}</code>"
+                )
+                lines.append(
+                    f"• <b>{html.escape(ticker)}</b> (<code>{pos.bars_held}/{pos.max_holding_bars}d</code>) — "
+                    f"Entry: <code>${pos.entry_price:,.2f}</code> | "
+                    f"Ratchet SL: <code>${pos.trailing_stop_price:,.2f}</code> | "
+                    f"TP: <code>${pos.take_profit_price:,.2f}</code> | {locked_profit_flag}"
+                )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_critical_alert(
+        error_message: str,
+        stage: str = "QuantPipelineOrchestrator",
+        as_of_date: Optional[date] = None,
+    ) -> str:
+        dt_str = as_of_date.isoformat() if as_of_date else "N/A"
+        safe_stage = html.escape(stage)
+        safe_err = html.escape(error_message[:1200])
+        return (
+            f"🚨 <b>CRITICAL: SWING QUANT ENGINE CIRCUIT BREAKER</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Date:</b> <code>{dt_str}</code>\n"
+            f"<b>Failed Stage:</b> <code>{safe_stage}</code>\n"
+            f"<b>Error Detail:</b>\n<pre>{safe_err}</pre>\n"
+            f"<i>Zero-Override Protection: Portfolio state was left untouched.</i>"
+        )
+
+    @staticmethod
+    def chunk_html_message(html_text: str, max_length: int = 4000) -> List[str]:
+        if len(html_text) <= max_length:
+            return [html_text]
+
+        chunks: List[str] = []
+        current_lines: List[str] = []
+        current_len = 0
+
+        for line in html_text.split("\n"):
+            line_len = len(line) + 1
+            if current_len + line_len > max_length and current_lines:
+                chunks.append("\n".join(current_lines))
+                current_lines = [line]
+                current_len = line_len
+            else:
+                current_lines.append(line)
+                current_len += line_len
+
+        if current_lines:
+            chunks.append("\n".join(current_lines))
+
+        return chunks
+
+
 class TelegramNotifier:
     """
     Resilient, multi-tenant HTML telemetry dispatcher for the Telegram Bot API
@@ -76,6 +239,7 @@ class TelegramNotifier:
         self.max_retries = max_retries
         self.base_backoff_sec = base_backoff_sec
         self.request_timeout_sec = request_timeout_sec
+        self.formatter = TelegramHTMLFormatter()
 
     @property
     def is_configured(self) -> bool:
@@ -138,7 +302,7 @@ class TelegramNotifier:
             else _unwrap_secret(getattr(self.settings, "telegram_chat_id", None))
         )
 
-        report_html = self.format_daily_portfolio_report_html(
+        report_html = TelegramHTMLFormatter.format_daily_portfolio_report_html(
             portfolio=portfolio,
             opened_positions=opened_positions,
             closed_trades=closed_trades,
@@ -147,7 +311,9 @@ class TelegramNotifier:
             dry_run=dry_run,
         )
 
-        chunks = self._chunk_html_message(report_html)
+        chunks = TelegramHTMLFormatter.chunk_html_message(
+            report_html, max_length=self.MAX_MESSAGE_LENGTH
+        )
         all_succeeded = True
 
         for idx, chunk in enumerate(chunks, start=1):
@@ -173,138 +339,12 @@ class TelegramNotifier:
             return False
 
         target_chat_id = _unwrap_secret(getattr(self.settings, "telegram_chat_id", None))
-        dt_str = as_of_date.isoformat() if as_of_date else "N/A"
-        safe_stage = html.escape(stage)
-        safe_err = html.escape(error_summary[:1200])
-
-        alert_html = (
-            f"🚨 <b>CRITICAL: SWING QUANT ENGINE CIRCUIT BREAKER</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Date:</b> <code>{dt_str}</code>\n"
-            f"<b>Failed Stage:</b> <code>{safe_stage}</code>\n"
-            f"<b>Error Detail:</b>\n<pre>{safe_err}</pre>\n"
-            f"<i>Zero-Override Protection: Portfolio state was left untouched.</i>"
+        alert_html = TelegramHTMLFormatter.format_critical_alert(
+            error_message=error_summary,
+            stage=stage,
+            as_of_date=as_of_date,
         )
         return self._send_html_payload(chat_id=target_chat_id, text=alert_html)
-
-    def format_daily_portfolio_report_html(
-        self,
-        portfolio: VirtualPortfolioLedgerSchema,
-        opened_positions: List[TripleBarrierPositionSchema],
-        closed_trades: List[ClosedTradeAuditSchema],
-        approved_signals: List[MetaLabeledSignalSchema],
-        as_of_date: date,
-        dry_run: bool = False,
-    ) -> str:
-        mode_badge = "🧪 SANDBOX DRY-RUN" if dry_run else "⚡ EOD PRODUCTION LEDGER"
-        safe_name = html.escape(portfolio.portfolio_name)
-        heat_pct = portfolio.current_portfolio_heat_pct * 100.0
-        max_heat_pct = portfolio.max_portfolio_heat_pct * 100.0
-
-        lines: List[str] = [
-            f"🏛️ <b>SWING QUANT ENGINE | {mode_badge}</b>",
-            f"<b>Portfolio:</b> {safe_name} (<code>{str(portfolio.portfolio_id)[:8]}</code>)",
-            f"<b>Tenant User:</b> <code>{str(portfolio.user_id)[:8]}</code>",
-            f"<b>Market Date:</b> <code>{as_of_date.isoformat()}</code>",
-            "━━━━━━━━━━━━━━━━━━",
-            "📊 <b>EXECUTIVE PORTFOLIO TELEMETRY</b>",
-            f"• <b>Total Equity:</b> <code>${portfolio.total_equity:,.2f}</code>",
-            f"• <b>Cash Balance:</b> <code>${portfolio.cash_balance:,.2f}</code>",
-            f"• <b>Active Capacity:</b> <code>{len(portfolio.open_positions)} / {portfolio.max_concurrent_positions} Slots</code>",
-            f"• <b>Portfolio Heat:</b> <code>{heat_pct:.2f}% / {max_heat_pct:.2f}% Max</code>",
-            "━━━━━━━━━━━━━━━━━━",
-        ]
-
-        lines.append(f"🎯 <b>TRIPLE-BARRIER EXITS ({len(closed_trades)})</b>")
-        if not closed_trades:
-            lines.append("<i>No barrier exits triggered during today's session.</i>")
-        else:
-            for trade in closed_trades:
-                badge = self._format_exit_reason_badge(trade.exit_reason)
-                pnl_sign = "+" if trade.realized_pnl_dollars >= 0 else ""
-                r_sign = "+" if trade.realized_r_multiple >= 0 else ""
-                lines.append(
-                    f"• <b>{html.escape(trade.ticker)}</b> [{html.escape(trade.index_id)}] — {badge}\n"
-                    f"  Exit: <code>${trade.exit_price:,.2f}</code> (Entry: <code>${trade.entry_price:,.2f}</code> | Held: <code>{trade.bars_held}d</code>)\n"
-                    f"  Realized: <code>{pnl_sign}${trade.realized_pnl_dollars:,.2f}</code> (<b>{r_sign}{trade.realized_r_multiple:.2f}R</b>)"
-                )
-        lines.append("━━━━━━━━━━━━━━━━━━")
-
-        lines.append(f"🚀 <b>NEW META-LABELED ENTRIES ({len(opened_positions)})</b>")
-        if not opened_positions:
-            lines.append("<i>No new positions allocated (filtered by Meta-Labeling or Heat Gate).</i>")
-        else:
-            sig_lookup: Dict[str, MetaLabeledSignalSchema] = {
-                s.primary_signal.ticker: s for s in approved_signals
-            }
-            for pos in opened_positions:
-                meta_info = sig_lookup.get(pos.ticker)
-                score_str = (
-                    f"Score: {meta_info.primary_signal.primary_score:.1f} | "
-                    f"φ: {meta_info.meta_conviction_scalar:.2f}x | "
-                    f"EV: +{meta_info.historical_ev_r_multiple:.2f}R"
-                    if meta_info
-                    else "Meta-Validated"
-                )
-                notional = pos.shares * pos.entry_price
-                lines.append(
-                    f"• <b>{html.escape(pos.ticker)}</b> [{html.escape(pos.index_id)}] — <code>{pos.shares} sh</code> @ <code>${pos.entry_price:,.2f}</code> (<code>${notional:,.0f}</code>)\n"
-                    f"  <i>{score_str}</i>\n"
-                    f"  Cage: SL <code>${pos.initial_stop_price:,.2f}</code> | TP <code>${pos.take_profit_price:,.2f}</code> | Max <code>{pos.max_holding_bars}d</code>"
-                )
-        lines.append("━━━━━━━━━━━━━━━━━━")
-
-        lines.append(f"🛡️ <b>ACTIVE TRIPLE-BARRIER BOOK ({len(portfolio.open_positions)})</b>")
-        if not portfolio.open_positions:
-            lines.append("<i>Portfolio is currently 100% in cash.</i>")
-        else:
-            for ticker, pos in sorted(portfolio.open_positions.items()):
-                locked_profit_flag = (
-                    "🔒 <i>(Risk-Free / Stop >= Entry)</i>"
-                    if pos.trailing_stop_price >= pos.entry_price
-                    else f"Open Risk: <code>${pos.open_dollar_risk:,.0f}</code>"
-                )
-                lines.append(
-                    f"• <b>{html.escape(ticker)}</b> (<code>{pos.bars_held}/{pos.max_holding_bars}d</code>) — "
-                    f"Entry: <code>${pos.entry_price:,.2f}</code> | "
-                    f"Ratchet SL: <code>${pos.trailing_stop_price:,.2f}</code> | "
-                    f"TP: <code>${pos.take_profit_price:,.2f}</code> | {locked_profit_flag}"
-                )
-
-        return "\n".join(lines)
-
-    @staticmethod
-    def _format_exit_reason_badge(reason: ExitReason) -> str:
-        if reason == ExitReason.UPPER_BARRIER_TP:
-            return "✅ <b>TAKE-PROFIT BARRIER</b>"
-        if reason == ExitReason.LOWER_BARRIER_SL:
-            return "🛑 <b>TRAILING STOP BARRIER</b>"
-        if reason == ExitReason.VERTICAL_BARRIER_TIME:
-            return "⏱️ <b>14-DAY TIME BARRIER</b>"
-        return "⚠️ <b>CIRCUIT BREAKER EXIT</b>"
-
-    def _chunk_html_message(self, html_text: str) -> List[str]:
-        if len(html_text) <= self.MAX_MESSAGE_LENGTH:
-            return [html_text]
-
-        chunks: List[str] = []
-        current_lines: List[str] = []
-        current_len = 0
-
-        for line in html_text.split("\n"):
-            line_len = len(line) + 1
-            if current_len + line_len > self.MAX_MESSAGE_LENGTH and current_lines:
-                chunks.append("\n".join(current_lines))
-                current_lines = [line]
-                current_len = line_len
-            else:
-                current_lines.append(line)
-                current_len += line_len
-
-        if current_lines:
-            chunks.append("\n".join(current_lines))
-
-        return chunks
 
     def _send_html_payload(self, chat_id: str, text: str) -> bool:
         token = _unwrap_secret(getattr(self.settings, "telegram_bot_token", None))

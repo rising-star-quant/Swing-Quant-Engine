@@ -75,7 +75,6 @@ class MarketDataRepository(ABC):
     @abstractmethod
     def save_ohlcv(self, ticker: str, df: pd.DataFrame) -> None:
         """Validates and atomically persists an OHLCV DataFrame for a ticker."""
-        raise NotImplementedError
 
     @abstractmethod
     def load_ohlcv(
@@ -84,17 +83,14 @@ class MarketDataRepository(ABC):
         lookback_days: Optional[int] = None,
     ) -> Optional[pd.DataFrame]:
         """Loads cached OHLCV history for a ticker, optionally sliced to trailing lookback_days."""
-        raise NotImplementedError
 
     @abstractmethod
     def get_latest_cached_date(self, ticker: str) -> Optional[date]:
         """Returns the most recent Point-in-Time settlement date stored for a ticker."""
-        raise NotImplementedError
 
     @abstractmethod
     def purge_ticker_history(self, ticker: str) -> None:
         """Removes cached OHLCV storage for a ticker (e.g., upon split invalidation)."""
-        raise NotImplementedError
 
 
 class PortfolioStateRepository(ABC):
@@ -106,12 +102,10 @@ class PortfolioStateRepository(ABC):
     @abstractmethod
     def load_state(self) -> MultiTenantStateStoreSchema:
         """Loads and validates the multi-tenant portfolio state store."""
-        raise NotImplementedError
 
     @abstractmethod
     def save_state(self, state: MultiTenantStateStoreSchema) -> None:
         """Validates and atomically persists the multi-tenant portfolio state store."""
-        raise NotImplementedError
 
 
 # =============================================================================
@@ -245,8 +239,8 @@ class ParquetMarketDataRepository(MarketDataRepository):
             if tmp_path.exists():
                 try:
                     tmp_path.unlink()
-                except OSError:
-                    pass
+                except OSError as cleanup_err:
+                    logger.debug(f"Temporary Parquet cleanup warning for {tmp_path}: {cleanup_err}")
             raise StorageError(
                 f"Atomic Parquet write failed for '{target_path}': {exc}"
             ) from exc
@@ -466,8 +460,8 @@ class JsonPortfolioStateRepository(PortfolioStateRepository):
                         tenant_portfolios={single_ledger.portfolio_id: single_ledger},
                     )
                     return migrated_state
-            except Exception:
-                pass
+            except Exception as fallback_err:
+                logger.debug(f"Legacy single-tenant migration check skipped: {fallback_err}")
 
             raise StateCorruptionError(
                 f"Portfolio state store at {self.state_path} failed schema or tenant isolation validation: {exc}"
@@ -513,8 +507,8 @@ class JsonPortfolioStateRepository(PortfolioStateRepository):
             if tmp_file_path is not None and tmp_file_path.exists():
                 try:
                     tmp_file_path.unlink()
-                except OSError:
-                    pass
+                except OSError as cleanup_err:
+                    logger.debug(f"Temporary state file cleanup warning for {tmp_file_path}: {cleanup_err}")
             raise StorageError(
                 f"Atomic state persistence failed for {self.state_path}: {exc}"
             ) from exc

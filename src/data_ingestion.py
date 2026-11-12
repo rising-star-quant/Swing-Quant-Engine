@@ -98,12 +98,10 @@ class MarketDataProvider(ABC):
         start_date and end_date (inclusive), returning a mapping of
         `ticker -> DataFrame` with columns `["Open", "High", "Low", "Close", "Volume"]`.
         """
-        raise NotImplementedError
 
     @abstractmethod
     def fetch_index_constituents(self, index_config: IndexConfigSchema) -> List[str]:
         """Resolves and returns the normalized constituent ticker roster for an index."""
-        raise NotImplementedError
 
     @abstractmethod
     def fetch_current_quotes_spread_proxy(self, tickers: Sequence[str]) -> Dict[str, float]:
@@ -111,7 +109,6 @@ class MarketDataProvider(ABC):
         Returns the relative bid-ask spread `(Ask - Bid) / Mid` per ticker,
         or `0.0` if unavailable in EOD-only fallback mode.
         """
-        raise NotImplementedError
 
 
 # =============================================================================
@@ -741,11 +738,11 @@ class BaseMarketDataProvider(ABC):
         start_date: date,
         end_date_inclusive: date,
     ) -> pd.DataFrame:
-        raise NotImplementedError
+        """Fetches MultiIndex (date, ticker) OHLCV DataFrame for a batch of tickers."""
 
     @abstractmethod
     def fetch_index_constituents(self, index_id: str) -> List[str]:
-        raise NotImplementedError
+        """Returns constituent symbols for the given index identifier."""
 
 
 class YFinanceProvider(BaseMarketDataProvider):
