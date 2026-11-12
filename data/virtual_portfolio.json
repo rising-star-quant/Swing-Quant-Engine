@@ -1,0 +1,75 @@
+{
+  "schema_version": "2.0.0",
+  "last_updated_utc": "2026-11-12T18:00:36.842982Z",
+  "index_registry": {
+    "RUT_2000": {
+      "index_id": "RUT_2000",
+      "display_name": "Russell 2000 Small-Cap Index",
+      "benchmark_ticker": "IWM",
+      "tier": "SMALL_CAP",
+      "is_active": true,
+      "min_price": 5.0,
+      "min_adv_30d": 500000,
+      "max_relative_spread": 0.005,
+      "volume_surge_multiplier": 1.8,
+      "weight_momentum": 0.45,
+      "weight_volume": 0.3,
+      "weight_rs": 0.25,
+      "k_stop_atr": 2.0,
+      "k_profit_atr": 6.0,
+      "max_holding_bars": 14
+    },
+    "SP_400": {
+      "index_id": "SP_400",
+      "display_name": "S&P MidCap 400 Index",
+      "benchmark_ticker": "MDY",
+      "tier": "MID_CAP",
+      "is_active": true,
+      "min_price": 5.0,
+      "min_adv_30d": 500000,
+      "max_relative_spread": 0.003,
+      "volume_surge_multiplier": 1.4,
+      "weight_momentum": 0.45,
+      "weight_volume": 0.3,
+      "weight_rs": 0.25,
+      "k_stop_atr": 1.75,
+      "k_profit_atr": 5.25,
+      "max_holding_bars": 14
+    },
+    "SP_500": {
+      "index_id": "SP_500",
+      "display_name": "S&P 500 Large-Cap Index",
+      "benchmark_ticker": "SPY",
+      "tier": "LARGE_CAP",
+      "is_active": false,
+      "min_price": 5.0,
+      "min_adv_30d": 1000000,
+      "max_relative_spread": 0.002,
+      "volume_surge_multiplier": 1.2,
+      "weight_momentum": 0.45,
+      "weight_volume": 0.3,
+      "weight_rs": 0.25,
+      "k_stop_atr": 1.5,
+      "k_profit_atr": 4.5,
+      "max_holding_bars": 14
+    }
+  },
+  "tenant_portfolios": {
+    "00000000-0000-4000-8000-000000000101": {
+      "portfolio_id": "00000000-0000-4000-8000-000000000101",
+      "user_id": "00000000-0000-4000-8000-000000000001",
+      "portfolio_name": "Primary Swing Shadow Portfolio",
+      "as_of_date": "2026-11-12",
+      "cash_balance": 100000.0,
+      "total_equity": 100000.0,
+      "max_portfolio_heat_pct": 0.06,
+      "max_concurrent_positions": 10,
+      "subscribed_indices": [
+        "RUT_2000",
+        "SP_400"
+      ],
+      "open_positions": {},
+      "closed_trades_audit": []
+    }
+  }
+}
