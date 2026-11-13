@@ -1,6 +1,6 @@
 {
   "schema_version": "2.0.0",
-  "last_updated_utc": "2026-11-12T22:11:09.092934Z",
+  "last_updated_utc": "2026-11-13T22:08:57.814224Z",
   "index_registry": {
     "RUT_2000": {
       "index_id": "RUT_2000",
@@ -59,7 +59,7 @@
       "portfolio_id": "00000000-0000-4000-8000-000000000101",
       "user_id": "00000000-0000-4000-8000-000000000001",
       "portfolio_name": "Primary Swing Shadow Portfolio",
-      "as_of_date": "2026-11-12",
+      "as_of_date": "2026-11-13",
       "cash_balance": 100000.0,
       "total_equity": 100000.0,
       "max_portfolio_heat_pct": 0.06,
