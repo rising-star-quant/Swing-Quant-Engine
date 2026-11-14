@@ -1,0 +1,74 @@
+@import "tailwindcss";
+@import "./styles/themes.css";
+
+@layer base {
+  html {
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+    font-family: 'Inter', 'Heebo', 'Noto Sans Arabic', -apple-system, BlinkMacSystemFont, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  html[lang="he"] {
+    font-family: 'Heebo', 'Inter', sans-serif;
+  }
+
+  html[lang="ar"] {
+    font-family: 'Noto Sans Arabic', 'Inter', sans-serif;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+    overflow-x: hidden;
+  }
+}
+
+/* Strictly enforced Tabular Monospace for all financial figures, tickers, R-multiples, and dates */
+.font-mono-tabular {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+/* Custom Theme Helper Classes */
+.sirix-canvas {
+  background-color: var(--bg-canvas);
+  color: var(--text-primary);
+}
+
+.sirix-surface {
+  background-color: var(--bg-surface);
+  border-color: var(--border-subtle);
+}
+
+.sirix-surface-hover:hover {
+  background-color: var(--bg-surface-hover);
+}
+
+.sirix-border {
+  border-color: var(--border-subtle);
+}
+
+.sirix-border-strong {
+  border-color: var(--border-strong);
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-canvas);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}

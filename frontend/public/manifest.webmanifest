@@ -1,0 +1,25 @@
+{
+  "name": "SIRIX — Autonomous Quant Telemetry",
+  "short_name": "SIRIX",
+  "description": "Zero-Override Swing-Trading Telemetry Client for Russell 2000 (RUT) & S&P MidCap 400 (MID) Universes.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#090D16",
+  "theme_color": "#090D16",
+  "orientation": "any",
+  "categories": ["finance", "productivity", "business"],
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='36' fill='%23090D16'/%3E%3Cpath d='M96 28L114 78L164 96L114 114L96 164L78 114L28 96L78 78Z' fill='%2306B6D4'/%3E%3Ccircle cx='96' cy='96' r='14' fill='%23F9FAFB'/%3E%3C/svg%3E",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='96' fill='%23090D16'/%3E%3Cpath d='M256 64L304 208L448 256L304 304L256 448L208 304L64 256L208 208Z' fill='%2306B6D4'/%3E%3Ccircle cx='256' cy='256' r='36' fill='%23F9FAFB'/%3E%3C/svg%3E",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

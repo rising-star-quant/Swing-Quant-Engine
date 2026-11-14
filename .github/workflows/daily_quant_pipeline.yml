@@ -23,6 +23,7 @@ concurrency:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   run-quant-engine:
@@ -47,18 +48,29 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
+          if [ -f "requirements-api.txt" ]; then
+            pip install -r requirements-api.txt
+          fi
 
-      - name: Gate 1 — Mathematical & Risk Invariant Verification
+      - name: Authenticate to Google Cloud via Workload Identity Federation (OIDC)
+        if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.GCP_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Gate 0 — Pre-Flight System Integrity Audit
+        run: python scripts/verify_system.py
+
+      - name: Gate 1 — Mathematical, Risk & API Contract Verification
         env:
           PYTHONPATH: .
           ENVIRONMENT: test
           DRY_RUN: 'true'
         run: |
-      - name: Gate 0 — Pre-Flight System Integrity Audit
-        run: python scripts/verify_system.py
           pytest -v --tb=short
 
-      - name: Gate 2 — Autonomous Daily EOD Execution
+      - name: Gate 2 — Autonomous Daily EOD Execution & GCS Telemetry Export
         env:
           PYTHONPATH: .
           ENVIRONMENT: ${{ github.event.inputs.dry_run == 'true' && 'sandbox' || 'production' }}
@@ -66,6 +78,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
+          SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
         run: |
           ARGS=("--mode" "daily")
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
@@ -97,3 +110,4 @@ jobs:
             git pull --rebase origin "${GITHUB_REF_NAME}"
             git push origin HEAD:"${GITHUB_REF_NAME}"
           fi
+

@@ -1,0 +1,86 @@
+/* ==========================================================================
+   SIRIX Theme System — F00_SIRIX_MASTER_ARCHITECTURE.md Section 5.1
+   Three Curated Palettes: obsidian-dark (default), sirius-ice-light, midnight-sapphire
+   ========================================================================== */
+
+:root,
+[data-theme="obsidian-dark"] {
+  --bg-canvas: #090D16;
+  --bg-surface: #111827;
+  --bg-surface-hover: #1A2234;
+  --border-subtle: #1F2937;
+  --border-strong: #374151;
+  --text-primary: #F9FAFB;
+  --text-secondary: #9CA3AF;
+  --text-muted: #6B7280;
+  --accent-brand: #06B6D4;
+  --accent-brand-subtle: rgba(6, 182, 212, 0.14);
+
+  /* Semantic Telemetry Tokens */
+  --semantic-emerald: #10B981;
+  --semantic-emerald-subtle: rgba(16, 185, 129, 0.14);
+  --semantic-amber: #F59E0B;
+  --semantic-amber-subtle: rgba(245, 158, 11, 0.14);
+  --semantic-crimson: #EF4444;
+  --semantic-crimson-subtle: rgba(239, 68, 68, 0.14);
+  --semantic-violet: #8B5CF6;
+  --semantic-violet-subtle: rgba(139, 92, 246, 0.14);
+  --semantic-cyan: #06B6D4;
+
+  --shadow-elevated: 0 20px 25px -5px rgba(0, 0, 0, 0.55), 0 8px 10px -6px rgba(0, 0, 0, 0.45);
+  color-scheme: dark;
+}
+
+[data-theme="sirius-ice-light"] {
+  --bg-canvas: #F0F7FF;
+  --bg-surface: #FFFFFF;
+  --bg-surface-hover: #E0F2FE;
+  --border-subtle: #BAE6FD;
+  --border-strong: #7DD3FC;
+  --text-primary: #0F172A;
+  --text-secondary: #334155;
+  --text-muted: #64748B;
+  --accent-brand: #0284C7;
+  --accent-brand-subtle: rgba(2, 132, 199, 0.12);
+
+  /* High-Contrast Semantic Telemetry Tokens for Daylight Readability */
+  --semantic-emerald: #059669;
+  --semantic-emerald-subtle: rgba(5, 150, 105, 0.12);
+  --semantic-amber: #D97706;
+  --semantic-amber-subtle: rgba(217, 119, 6, 0.12);
+  --semantic-crimson: #DC2626;
+  --semantic-crimson-subtle: rgba(220, 38, 38, 0.12);
+  --semantic-violet: #7C3AED;
+  --semantic-violet-subtle: rgba(124, 58, 237, 0.12);
+  --semantic-cyan: #0284C7;
+
+  --shadow-elevated: 0 12px 24px -4px rgba(15, 23, 42, 0.08), 0 4px 8px -2px rgba(15, 23, 42, 0.04);
+  color-scheme: light;
+}
+
+[data-theme="midnight-sapphire"] {
+  --bg-canvas: #0B192C;
+  --bg-surface: #132743;
+  --bg-surface-hover: #1B365D;
+  --border-subtle: #1E3A5F;
+  --border-strong: #2E5488;
+  --text-primary: #F1F5F9;
+  --text-secondary: #94A3B8;
+  --text-muted: #64748B;
+  --accent-brand: #38BDF8;
+  --accent-brand-subtle: rgba(56, 189, 248, 0.15);
+
+  /* Semantic Telemetry Tokens */
+  --semantic-emerald: #10B981;
+  --semantic-emerald-subtle: rgba(16, 185, 129, 0.15);
+  --semantic-amber: #F59E0B;
+  --semantic-amber-subtle: rgba(245, 158, 11, 0.15);
+  --semantic-crimson: #EF4444;
+  --semantic-crimson-subtle: rgba(239, 68, 68, 0.15);
+  --semantic-violet: #A78BFA;
+  --semantic-violet-subtle: rgba(167, 139, 250, 0.15);
+  --semantic-cyan: #38BDF8;
+
+  --shadow-elevated: 0 20px 25px -5px rgba(5, 12, 24, 0.65), 0 8px 10px -6px rgba(5, 12, 24, 0.5);
+  color-scheme: dark;
+}

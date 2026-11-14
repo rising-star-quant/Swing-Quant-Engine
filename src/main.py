@@ -46,6 +46,11 @@ try:
         ParquetMarketDataRepository,
         PortfolioStateRepository,
     )
+    from src.api_exporter import (
+        PRIMARY_SIRIX_USER_ID,
+        SirixCloudExporter,
+        load_user_guardrails,
+    )
 except ImportError:
     from config import (  # type: ignore[no-redef]
         SystemSettings,
@@ -81,6 +86,11 @@ except ImportError:
         MarketDataRepository,
         ParquetMarketDataRepository,
         PortfolioStateRepository,
+    )
+    from api_exporter import (  # type: ignore[no-redef]
+        PRIMARY_SIRIX_USER_ID,
+        SirixCloudExporter,
+        load_user_guardrails,
     )
 
 
@@ -158,6 +168,7 @@ class QuantPipelineOrchestrator:
         self.screening_engine = PrimaryScreeningEngine(settings=self.settings)
         self.backtest_engine = MetaLabelingBacktestEngine(settings=self.settings)
         self.reconciler = TenantPortfolioReconciler(settings=self.settings)
+        self.cloud_exporter = SirixCloudExporter(market_repo=self.market_repo)
 
     def ensure_default_tenant_initialized(
         self,
@@ -227,8 +238,11 @@ class QuantPipelineOrchestrator:
 
         try:
             # -----------------------------------------------------------------
-            # Phase 1 — Load Multi-Tenant State & Active Index Registry
+            # Phase 1 — Load Multi-Tenant State, User Guardrails & Active Index Registry
             # -----------------------------------------------------------------
+            user_prefs = load_user_guardrails(PRIMARY_SIRIX_USER_ID)
+            kill_switch_active = user_prefs.guardrails.kill_switch_active
+
             state = self.state_repo.load_state()
             if not state.index_registry:
                 registry = load_index_registry(self.settings.index_registry_path)
@@ -395,10 +409,11 @@ class QuantPipelineOrchestrator:
                     )
                 )
 
+                effective_signals = [] if kill_switch_active else approved_signals
                 opened_positions: List[TripleBarrierPositionSchema] = (
                     self.reconciler.allocate_new_signals(
                         ledger=ledger,
-                        approved_signals=approved_signals,
+                        approved_signals=effective_signals,
                         as_of_date=target_date,
                     )
                 )
@@ -409,6 +424,15 @@ class QuantPipelineOrchestrator:
                 # Persist updated state atomically per tenant reconciliation
                 if not self.settings.dry_run:
                     self.state_repo.save_state(state)
+
+                # Export SIRIX 4 canonical telemetry JSON contracts to GCS / local data dir
+                self.cloud_exporter.export_all(
+                    ledger=ledger,
+                    user_id=PRIMARY_SIRIX_USER_ID,
+                    approved_signals=approved_signals,
+                    vetoed_signals=vetoed_signals,
+                    as_of_date=target_date,
+                )
 
                 report_payload = TenantDailyReportPayload(
                     as_of_date=target_date,
