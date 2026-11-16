@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Sequence
+import hmac
+import os
+import threading
+import time
+from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 from uuid import UUID
 
 from argon2 import PasswordHasher, Type
@@ -36,6 +41,24 @@ class AuthorizationError(SecurityError):
 
 class SecurityViolationError(SecurityError, PermissionError):
     """Raised when authentication, token signature, or tenant isolation fails."""
+
+
+class RateLimitExceededError(SecurityError):
+    """Raised when an IP exceeds the sliding-window login failure threshold (HTTP 429)."""
+
+    def __init__(self, message: str, retry_after_seconds: int = 900) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class SchedulerAuthError(SecurityError):
+    """Raised when X-Sirix-Scheduler-Token fails constant-time verification (HTTP 403)."""
+
+
+SESSION_COOKIE_NAME: str = "sirix_session"
+SESSION_TTL_SECONDS: int = 86_400
+LOGIN_MAX_ATTEMPTS: int = 5
+LOGIN_WINDOW_SECONDS: int = 900
 
 
 # =============================================================================
@@ -336,3 +359,254 @@ class MultiTenantSecurityService:
             raise SecurityViolationError(
                 "RBAC VIOLATION: VIEWER role is prohibited from mutating portfolio state."
             )
+
+
+# =============================================================================
+# 6. F01 SINGLE-ORIGIN COOKIE AUTH, RATE LIMITING & SCHEDULER GUARD
+# =============================================================================
+
+
+class SlidingWindowLoginRateLimiter:
+    """
+    Thread-safe in-memory per-IP sliding-window rate limiter enforcing a maximum
+    of `max_attempts` failed login attempts per `window_seconds` (default: 5 / 15 min).
+    """
+
+    def __init__(
+        self,
+        max_attempts: int = LOGIN_MAX_ATTEMPTS,
+        window_seconds: int = LOGIN_WINDOW_SECONDS,
+        clock: Any = time.monotonic,
+    ) -> None:
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be a positive integer.")
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be a positive integer.")
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._attempts: Dict[str, Deque[float]] = {}
+
+    def _prune_locked(self, key: str, now_ts: float) -> Deque[float]:
+        bucket = self._attempts.get(key)
+        if bucket is None:
+            bucket = deque()
+            self._attempts[key] = bucket
+        cutoff = now_ts - float(self.window_seconds)
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if not bucket:
+            self._attempts.pop(key, None)
+        return bucket
+
+    def check_allowed(self, client_ip: str) -> None:
+        """
+        Verifies whether `client_ip` is below the failed-attempt ceiling.
+        Raises `RateLimitExceededError` (HTTP 429) if throttled.
+        """
+        key = (client_ip or "unknown").strip() or "unknown"
+        now_ts = float(self._clock())
+        with self._lock:
+            bucket = self._prune_locked(key, now_ts)
+            if len(bucket) >= self.max_attempts:
+                oldest = bucket[0]
+                retry_after = max(1, int(self.window_seconds - (now_ts - oldest)))
+                raise RateLimitExceededError(
+                    "Too many failed authentication attempts. Please retry after cooldown.",
+                    retry_after_seconds=retry_after,
+                )
+
+    def record_failure(self, client_ip: str) -> int:
+        """
+        Records a failed authentication timestamp for `client_ip` and returns the
+        current failure count inside the active sliding window.
+        """
+        key = (client_ip or "unknown").strip() or "unknown"
+        now_ts = float(self._clock())
+        with self._lock:
+            bucket = self._attempts.setdefault(key, deque())
+            cutoff = now_ts - float(self.window_seconds)
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            bucket.append(now_ts)
+            return len(bucket)
+
+    def reset(self, client_ip: str) -> None:
+        """Clears failed login history for `client_ip` after a successful login."""
+        key = (client_ip or "unknown").strip() or "unknown"
+        with self._lock:
+            self._attempts.pop(key, None)
+
+    def remaining_attempts(self, client_ip: str) -> int:
+        """Returns remaining login attempts available for `client_ip` in the current window."""
+        key = (client_ip or "unknown").strip() or "unknown"
+        now_ts = float(self._clock())
+        with self._lock:
+            bucket = self._prune_locked(key, now_ts)
+            return max(0, self.max_attempts - len(bucket))
+
+
+class SingleOriginCookieSessionManager:
+    """
+    Manages F01 Single-Origin cookie authentication (`sirix_session`) backed by
+    Argon2id credential verification (`ADMIN_PASSWORD_HASH`) and HS256 JWT tokens
+    with 24-hour expiration (`HttpOnly; Secure; SameSite=Strict`).
+    """
+
+    DEFAULT_ADMIN_SUBJECT = UUID("00000000-0000-4000-8000-000000000001")
+
+    def __init__(
+        self,
+        settings: Optional[SystemSettings] = None,
+        admin_username: Optional[str] = None,
+        admin_password_hash: Optional[str] = None,
+        jwt_secret_key: Optional[str] = None,
+        session_ttl_seconds: int = SESSION_TTL_SECONDS,
+    ) -> None:
+        self.settings: SystemSettings = settings or get_settings()
+        self.password_manager = PasswordManager()
+        self.session_ttl_seconds = session_ttl_seconds
+        self.cookie_name = SESSION_COOKIE_NAME
+
+        self.admin_username = (
+            admin_username
+            if admin_username is not None
+            else os.environ.get("ADMIN_USERNAME", "admin")
+        ).strip() or "admin"
+
+        env_hash = (
+            admin_password_hash
+            if admin_password_hash is not None
+            else os.environ.get("ADMIN_PASSWORD_HASH", "")
+        ).strip()
+
+        if not env_hash and self.settings.environment != "production":
+            dev_plain = os.environ.get("SIRIX_DEV_ADMIN_PASSWORD", "sirix-sandbox-admin")
+            env_hash = self.password_manager.hash_password(dev_plain)
+        self._admin_password_hash: str = env_hash
+
+        resolved_secret = (
+            jwt_secret_key
+            or os.environ.get("JWT_SECRET_KEY", "").strip()
+            or self.settings.jwt_secret_key
+        )
+        if len(resolved_secret) < 32:
+            raise SecurityError("JWT secret key must be at least 32 characters long.")
+        if self.settings.environment == "production" and "CHANGE_ME" in resolved_secret.upper():
+            raise SecurityError(
+                "CRITICAL SECURITY VIOLATION: Insecure placeholder JWT secret key is prohibited in production."
+            )
+        self._jwt_secret_key = resolved_secret
+
+    def authenticate_credentials(self, username: str, password: str) -> Tuple[str, datetime]:
+        """
+        Verifies username + password in constant time against `ADMIN_USERNAME` and
+        Argon2id `ADMIN_PASSWORD_HASH`. Returns `(jwt_token, expires_at_utc)`.
+        """
+        clean_user = (username or "").strip().lower()
+        expected_user = self.admin_username.strip().lower()
+        user_matches = hmac.compare_digest(clean_user.encode("utf-8"), expected_user.encode("utf-8"))
+
+        if not self._admin_password_hash:
+            raise AuthenticationError("Authentication credentials rejected.")
+
+        password_matches = self.password_manager.verify_password(
+            password or "",
+            self._admin_password_hash,
+        )
+
+        if not (user_matches and password_matches):
+            raise AuthenticationError("Invalid credentials provided.")
+
+        return self.issue_session_token(username=self.admin_username)
+
+    def issue_session_token(
+        self,
+        username: Optional[str] = None,
+        role: UserRole = UserRole.ADMIN,
+    ) -> Tuple[str, datetime]:
+        """Issues an HS256 JWT token valid for `session_ttl_seconds` (24 hours)."""
+        now_utc = datetime.now(timezone.utc)
+        expires_at_utc = now_utc + timedelta(seconds=self.session_ttl_seconds)
+        iat = int(now_utc.timestamp())
+        exp = int(expires_at_utc.timestamp())
+
+        payload = JWTTokenPayload(
+            sub=self.DEFAULT_ADMIN_SUBJECT,
+            role=role,
+            exp=exp,
+            iat=iat,
+        )
+        claims: Dict[str, Any] = {
+            "sub": str(payload.sub),
+            "role": payload.role.value,
+            "username": (username or self.admin_username),
+            "exp": payload.exp,
+            "iat": payload.iat,
+        }
+        token = jwt.encode(claims, self._jwt_secret_key, algorithm="HS256")
+        return token, expires_at_utc
+
+    def verify_session_cookie(self, token: Optional[str]) -> Dict[str, Any]:
+        """
+        Cryptographically verifies the `sirix_session` cookie JWT and returns
+        validated session metadata (`sub`, `username`, `role`, `expires_at_utc`).
+        """
+        if not token or not isinstance(token, str):
+            raise AuthenticationError("Missing or empty session cookie.")
+
+        try:
+            decoded: Dict[str, Any] = jwt.decode(
+                token,
+                self._jwt_secret_key,
+                algorithms=["HS256"],
+                options={"require": ["sub", "role", "exp", "iat"]},
+            )
+            validated = JWTTokenPayload.model_validate(decoded)
+        except jwt.ExpiredSignatureError as exc:
+            raise AuthenticationError("Session cookie has expired.") from exc
+        except (jwt.InvalidTokenError, ValidationError, ValueError) as exc:
+            raise AuthenticationError(f"Invalid session cookie: {exc}") from exc
+
+        return {
+            "sub": str(validated.sub),
+            "role": validated.role.value,
+            "username": str(decoded.get("username") or self.admin_username),
+            "expires_at_utc": datetime.fromtimestamp(validated.exp, tz=timezone.utc),
+        }
+
+    def cookie_attributes(self) -> Dict[str, Any]:
+        """Returns strict single-origin cookie flags (`HttpOnly; Secure; SameSite=Strict`)."""
+        secure_flag = os.environ.get("SIRIX_COOKIE_SECURE", "true").strip().lower() != "false"
+        return {
+            "key": self.cookie_name,
+            "httponly": True,
+            "secure": secure_flag,
+            "samesite": "strict",
+            "max_age": self.session_ttl_seconds,
+            "path": "/",
+        }
+
+
+def verify_internal_scheduler_token(
+    provided_token: Optional[str],
+    expected_token: Optional[str] = None,
+) -> None:
+    """
+    Validates `X-Sirix-Scheduler-Token` in constant time against `INTERNAL_SCHEDULER_TOKEN`.
+    Raises `SchedulerAuthError` (HTTP 403 Forbidden) on missing, unconfigured, or mismatched tokens.
+    """
+    configured = (
+        expected_token
+        if expected_token is not None
+        else os.environ.get("INTERNAL_SCHEDULER_TOKEN", "")
+    ).strip()
+    supplied = (provided_token or "").strip()
+
+    if not configured or not supplied:
+        raise SchedulerAuthError("Forbidden: Missing or unconfigured internal scheduler token.")
+
+    if not hmac.compare_digest(supplied.encode("utf-8"), configured.encode("utf-8")):
+        raise SchedulerAuthError("Forbidden: Invalid internal scheduler token.")
+

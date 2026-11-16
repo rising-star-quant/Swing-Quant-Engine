@@ -1,4 +1,14 @@
-FROM python:3.11-slim AS base
+# Stage 1: Build React / PWA Frontend Assets
+FROM node:20-slim AS frontend-builder
+
+WORKDIR /app/frontend
+COPY frontend/package*.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+RUN npm run build
+
+# Stage 2: Python 3.11 FastAPI Single-Origin Server + Static GUI
+FROM python:3.11-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -13,19 +23,23 @@ WORKDIR /app
 RUN groupadd --system --gid 10001 appgroup && \
     useradd --system --uid 10001 --gid appgroup --create-home --shell /usr/sbin/nologin appuser
 
-# Install minimal runtime dependencies in cached layer
+# Install runtime dependencies
+COPY requirements.txt /app/requirements.txt
 COPY requirements-api.txt /app/requirements-api.txt
 RUN pip install --upgrade pip && \
-    pip install -r /app/requirements-api.txt
+    pip install -r /app/requirements.txt -r /app/requirements-api.txt
 
-# Copy application source and configuration
+# Copy backend application source, configuration, and fallback seed data
 COPY api /app/api
 COPY src /app/src
 COPY config /app/config
 COPY data /app/data
 
-# Ensure local fallback data directory is writable by non-root appuser
-RUN mkdir -p /app/data/users && \
+# Copy compiled React/PWA static bundle from Stage 1
+COPY --from=frontend-builder /app/frontend/dist /app/static_gui
+
+# Ensure local fallback directories are writable by non-root appuser
+RUN mkdir -p /app/data/state /app/data/users /app/data/portfolios /app/data/ohlcv_parquet && \
     chown -R appuser:appgroup /app
 
 USER appuser
@@ -33,24 +47,6 @@ USER appuser
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD python -c "import os, urllib.request; port = os.environ.get('PORT', '8080'); urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=3)" || exit 1
+    CMD python -c "import os, urllib.request; port = os.environ.get('PORT', '8080'); urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health', timeout=3)" || exit 1
 
-CMD ["sh", "-c", "exec uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1 --proxy-headers"]
-# Stage 1: Build React / PWA Frontend
-FROM node:20-slim AS frontend-builder
-WORKDIR /app/frontend
-COPY frontend/package*.json ./
-RUN npm ci
-COPY frontend/ ./
-RUN npm run build
-
-# Stage 2: Python FastAPI + Static GUI Server
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-COPY --from=frontend-builder /app/frontend/dist ./static_gui
-
-ENV PORT=8080
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["sh", "-c", "exec uvicorn src.api:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1 --proxy-headers"]

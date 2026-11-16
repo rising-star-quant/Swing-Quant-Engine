@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from enum import Enum
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 from uuid import UUID, uuid4
 
 from pydantic import (
@@ -811,3 +811,191 @@ class MultiTenantStateStoreSchema(BaseModel):
                     f"portfolio_id ({ledger.portfolio_id})."
                 )
         return self
+
+
+# =============================================================================
+# 6. F01 SINGLE-ORIGIN CLOUD RUN API & TELEMETRY CONTRACTS (PYDANTIC V2)
+# =============================================================================
+
+EODExecutionStatus = Literal[
+    "IDLE",
+    "RUNNING_EOD",
+    "SKIPPED_MARKET_CLOSED",
+    "FAILED_DATA_DELAY",
+    "CRITICAL_ERROR",
+]
+
+IndexSourceLiteral = Literal["RUT_2000", "SP_400", "SP_500"]
+AuditTradeExitReasonLiteral = Literal[
+    "TAKE_PROFIT",
+    "RATCHET_STOP",
+    "TIME_BARRIER_14D",
+    "SPLIT_ADJUSTED_EXIT",
+]
+
+
+class SystemHealthTelemetry(BaseModel):
+    """F01 Section 2.A EOD operational health telemetry contract (`GET /api/system/status`)."""
+
+    eod_status: EODExecutionStatus = Field(
+        ...,
+        description="Current or most recent nightly EOD pipeline execution state",
+    )
+    last_successful_eod_timestamp: Optional[datetime] = Field(
+        default=None,
+        description="ISO-8601 UTC timestamp of the last completed EOD state persistence",
+    )
+    last_trading_date_processed: Optional[str] = Field(
+        default=None,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description="Most recent NYSE trading date settled (YYYY-MM-DD)",
+    )
+    next_scheduled_run_utc: datetime = Field(
+        ...,
+        description="Next scheduled weekday EOD run (21:45 UTC)",
+    )
+    storage_backend: Literal["GCS", "LOCAL_FALLBACK"] = Field(
+        ...,
+        description="Active state storage source",
+    )
+    failure_reason: Optional[str] = Field(
+        default=None,
+        description="Sanitized diagnostic message when eod_status is FAILED_DATA_DELAY or CRITICAL_ERROR",
+    )
+
+
+class ActivePositionDTO(BaseModel):
+    """F01 Section 2.B read-only active Triple-Barrier position transfer contract."""
+
+    ticker: str = Field(..., min_length=1, max_length=12)
+    index_source: IndexSourceLiteral
+    entry_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    entry_price: float = Field(..., gt=0)
+    current_price: float = Field(..., gt=0)
+    shares: int = Field(..., gt=0)
+    initial_stop_price: float = Field(..., gt=0)
+    ratchet_stop_price: float = Field(..., gt=0)
+    take_profit_price: float = Field(..., gt=0)
+    atr_14: float = Field(..., gt=0)
+    meta_confidence_phi: float = Field(..., ge=0.5, le=1.25)
+    days_held: int = Field(..., ge=0, le=14)
+    max_holding_days: int = Field(default=14, ge=1, le=30)
+    unrealized_pnl_usd: float
+    unrealized_pnl_pct: float
+    unrealized_r_multiple: float
+    open_risk_usd: float = Field(
+        ...,
+        ge=0,
+        description="Zero once ratchet_stop_price >= entry_price",
+    )
+
+    @field_validator("ticker")
+    @classmethod
+    def normalize_ticker(cls, v: str) -> str:
+        return v.strip().upper()
+
+    @model_validator(mode="after")
+    def enforce_risk_free_stop_invariant(self) -> ActivePositionDTO:
+        """Strictly enforces open_risk_usd == 0.0 once ratchet_stop_price >= entry_price."""
+        if self.ratchet_stop_price >= self.entry_price:
+            if abs(self.open_risk_usd) > 1e-6:
+                raise ValueError(
+                    f"OPEN RISK INVARIANT VIOLATION for {self.ticker}: "
+                    f"open_risk_usd must be 0.0 once ratchet_stop_price ({self.ratchet_stop_price}) "
+                    f">= entry_price ({self.entry_price}), got {self.open_risk_usd}."
+                )
+            self.open_risk_usd = 0.0
+        return self
+
+
+class PortfolioSummaryResponse(BaseModel):
+    """F01 Section 2.B executive portfolio ledger response (`GET /api/portfolio/summary`)."""
+
+    as_of_utc: datetime
+    total_equity_usd: float = Field(..., gt=0)
+    cash_balance_usd: float = Field(..., ge=0)
+    invested_capital_usd: float = Field(..., ge=0)
+    portfolio_heat_pct: float = Field(..., ge=0.0, le=6.0)
+    max_heat_cap_pct: float = Field(default=6.0)
+    open_positions_count: int = Field(..., ge=0, le=10)
+    max_positions_cap: int = Field(default=10)
+    cumulative_return_pct: float
+    win_rate_pct: float = Field(..., ge=0.0, le=100.0)
+    expectancy_r: float
+    positions: List[ActivePositionDTO]
+
+
+class EquityCurvePointDTO(BaseModel):
+    """F01 Section 2.C historical portfolio NAV & benchmark point (`GET /api/portfolio/equity-curve`)."""
+
+    date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    portfolio_nav: float = Field(..., gt=0)
+    benchmark_iwm_norm: float = Field(..., gt=0)
+    benchmark_mdy_norm: float = Field(..., gt=0)
+    heat_pct: float = Field(..., ge=0.0, le=15.0)
+
+
+class AuditTradeDTO(BaseModel):
+    """F01 Section 2.C closed trade audit record (`GET /api/portfolio/audit-ledger`)."""
+
+    trade_id: str
+    ticker: str = Field(..., min_length=1, max_length=12)
+    index_source: IndexSourceLiteral
+    entry_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    exit_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    entry_price: float = Field(..., gt=0)
+    exit_price: float = Field(..., gt=0)
+    shares: int = Field(..., gt=0)
+    realized_pnl_usd: float
+    realized_r_multiple: float
+    exit_reason: AuditTradeExitReasonLiteral
+    corporate_action_note: Optional[str] = None
+
+    @field_validator("ticker")
+    @classmethod
+    def normalize_ticker(cls, v: str) -> str:
+        return v.strip().upper()
+
+
+class AuditLedgerResponse(BaseModel):
+    """Paginated closed trade audit response (`GET /api/portfolio/audit-ledger`)."""
+
+    total_count: int = Field(..., ge=0)
+    page: int = Field(..., ge=1)
+    page_size: int = Field(..., ge=1, le=100)
+    total_pages: int = Field(..., ge=1)
+    items: List[AuditTradeDTO]
+
+
+class LoginRequest(BaseModel):
+    """Single-origin cookie login payload (`POST /api/auth/login`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(..., min_length=1, max_length=120)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+class LoginResponse(BaseModel):
+    """Cookie-only authentication response (never exposes raw JWT)."""
+
+    authenticated: bool
+    expires_at_utc: datetime
+
+
+class AuthSessionStatusResponse(BaseModel):
+    """Current authenticated cookie session verification response (`GET /api/auth/me`)."""
+
+    authenticated: bool
+    username: str
+    role: str
+    expires_at_utc: datetime
+
+
+class InternalTriggerEODResponse(BaseModel):
+    """Internal Cloud Scheduler & cache invalidation hook response (`POST /api/internal/trigger-eod`)."""
+
+    status: Literal["accepted"] = "accepted"
+    cache_invalidated: bool = True
+    triggered_at_utc: datetime
+

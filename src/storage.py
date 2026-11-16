@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 import json
 import logging
 import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Dict, Optional
+import threading
+import time
+from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple
 from uuid import UUID
 
 import numpy as np
@@ -15,19 +18,33 @@ import pandas as pd
 from pydantic import ValidationError
 
 try:
+    import psycopg  # type: ignore[import-not-found]
+except ImportError:
+    psycopg = None  # type: ignore[assignment]
+
+try:
+    from google.cloud import storage as gcs_storage  # type: ignore[import-not-found]
+except ImportError:
+    gcs_storage = None  # type: ignore[assignment]
+
+try:
     from src.config import SystemSettings, get_settings, load_index_registry
     from src.schemas import (
         IndexConfigSchema,
+        JWTTokenPayload,
         MultiTenantStateStoreSchema,
         VirtualPortfolioLedgerSchema,
     )
+    from src.security import MultiTenantSecurityService
 except ImportError:
     from config import SystemSettings, get_settings, load_index_registry  # type: ignore[no-redef]
     from schemas import (  # type: ignore[no-redef]
         IndexConfigSchema,
+        JWTTokenPayload,
         MultiTenantStateStoreSchema,
         VirtualPortfolioLedgerSchema,
     )
+    from security import MultiTenantSecurityService  # type: ignore[no-redef]
 
 logger = logging.getLogger("SwingQuantEngine.Storage")
 
@@ -58,6 +75,13 @@ class StateCorruptionError(StorageError):
     """
     Raised when virtual_portfolio.json fails Pydantic schema validation
     or cross-tenant isolation checks.
+    """
+
+
+class MalformedStateError(StateCorruptionError):
+    """
+    Raised when persisted JSON state (GCS or local fallback) is malformed or
+    fails structural validation (mapped to HTTP 503 Service Unavailable).
     """
 
 
@@ -467,6 +491,52 @@ class JsonPortfolioStateRepository(PortfolioStateRepository):
                 f"Portfolio state store at {self.state_path} failed schema or tenant isolation validation: {exc}"
             ) from exc
 
+    @staticmethod
+    def _write_text_atomically(target_path: Path, json_payload: str) -> None:
+        """
+        Atomically persists JSON text using NamedTemporaryFile + flush + fsync + os.replace
+        so downstream readers never observe partial writes.
+        """
+        parent_dir = target_path.parent
+        parent_dir.mkdir(parents=True, exist_ok=True)
+        tmp_file_path: Optional[Path] = None
+        try:
+            with NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(parent_dir),
+                prefix=f".{target_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_file:
+                tmp_file_path = Path(tmp_file.name)
+                tmp_file.write(json_payload)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+
+            os.replace(tmp_file_path, target_path)
+        except Exception as exc:
+            if tmp_file_path is not None and tmp_file_path.exists():
+                try:
+                    tmp_file_path.unlink()
+                except OSError as cleanup_err:
+                    logger.debug(f"Temporary state file cleanup warning for {tmp_file_path}: {cleanup_err}")
+            raise StorageError(
+                f"Atomic state persistence failed for {target_path}: {exc}"
+            ) from exc
+
+    def _resolve_mirrored_state_dir(self) -> Optional[Path]:
+        """
+        Returns `{base_dir}/data/state` when operating against the canonical
+        `{base_dir}/data/virtual_portfolio.json` store so production commits and
+        Cloud Run API state readers remain synchronized without mutating repo files
+        during isolated sandbox/test runs.
+        """
+        canonical_primary = (self.settings.base_dir / "data" / "virtual_portfolio.json").resolve()
+        if self.state_path == canonical_primary:
+            return (self.settings.base_dir / "data" / "state").resolve()
+        return None
+
     def save_state(self, state: MultiTenantStateStoreSchema) -> None:
         """
         Re-validates `state` to enforce cross-tenant isolation and Portfolio Heat invariants,
@@ -484,34 +554,61 @@ class JsonPortfolioStateRepository(PortfolioStateRepository):
         validated_state.last_updated_utc = now_utc
 
         json_payload = validated_state.model_dump_json(indent=2)
-        parent_dir = self.state_path.parent
-        parent_dir.mkdir(parents=True, exist_ok=True)
+        self._write_text_atomically(self.state_path, json_payload)
 
-        tmp_file_path: Optional[Path] = None
-        try:
-            with NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=str(parent_dir),
-                prefix=f".{self.state_path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as tmp_file:
-                tmp_file_path = Path(tmp_file.name)
-                tmp_file.write(json_payload)
-                tmp_file.flush()
-                os.fsync(tmp_file.fileno())
+        mirrored_dir = self._resolve_mirrored_state_dir()
+        if mirrored_dir is not None:
+            mirrored_state_path = mirrored_dir / "virtual_portfolio.json"
+            if mirrored_state_path != self.state_path:
+                self._write_text_atomically(mirrored_state_path, json_payload)
 
-            os.replace(tmp_file_path, self.state_path)
-        except Exception as exc:
-            if tmp_file_path is not None and tmp_file_path.exists():
-                try:
-                    tmp_file_path.unlink()
-                except OSError as cleanup_err:
-                    logger.debug(f"Temporary state file cleanup warning for {tmp_file_path}: {cleanup_err}")
-            raise StorageError(
-                f"Atomic state persistence failed for {self.state_path}: {exc}"
-            ) from exc
+    def save_eod_heartbeat(
+        self,
+        state: MultiTenantStateStoreSchema,
+        trading_date: date,
+        eod_status: str = "HEALTHY",
+    ) -> Dict[str, Any]:
+        """
+        Atomically persists `eod_heartbeat.json` telemetry metadata alongside the
+        portfolio ledger (and mirrors to `data/state/eod_heartbeat.json` in production).
+        """
+        ledgers = list(state.tenant_portfolios.values())
+        primary_ledger = ledgers[0] if ledgers else None
+        heat_pct = (
+            round(primary_ledger.current_portfolio_heat_pct * 100.0, 2)
+            if primary_ledger is not None
+            else 0.0
+        )
+        open_positions_count = (
+            sum(len(ledger.open_positions) for ledger in ledgers) if ledgers else 0
+        )
+        total_equity = (
+            round(primary_ledger.total_equity, 2) if primary_ledger is not None else 0.0
+        )
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        heartbeat_payload: Dict[str, Any] = {
+            "last_successful_eod_timestamp": now_iso,
+            "last_updated_utc": now_iso,
+            "eod_status": eod_status,
+            "trading_date": trading_date.isoformat(),
+            "current_portfolio_heat_pct": heat_pct,
+            "portfolio_heat_pct": heat_pct,
+            "open_positions_count": open_positions_count,
+            "total_equity": total_equity,
+        }
+        serialized = json.dumps(heartbeat_payload, indent=2, ensure_ascii=False)
+
+        primary_heartbeat_path = self.state_path.parent / "eod_heartbeat.json"
+        self._write_text_atomically(primary_heartbeat_path, serialized)
+
+        mirrored_dir = self._resolve_mirrored_state_dir()
+        if mirrored_dir is not None:
+            mirrored_heartbeat_path = mirrored_dir / "eod_heartbeat.json"
+            if mirrored_heartbeat_path != primary_heartbeat_path:
+                self._write_text_atomically(mirrored_heartbeat_path, serialized)
+
+        return heartbeat_payload
 
     def upsert_tenant_portfolio(
         self,
@@ -583,7 +680,341 @@ class JsonPortfolioStateRepository(PortfolioStateRepository):
         self.save_state(state)
 
 
+# =============================================================================
+# 5. PHASE 2 POSTGRESQL / SUPABASE ROW-LEVEL SECURITY (RLS) ADAPTER
+# =============================================================================
+
+
+class PostgresMultiTenantRepository:
+    """
+    Phase 2 Drop-in Relational Storage Adapter for Supabase / PostgreSQL.
+    Binds the authenticated user's JWT `sub` claim directly into the PostgreSQL
+    transaction context (`request.jwt.claim.sub`) so Row-Level Security (RLS)
+    physically prevents cross-tenant data access at the database engine level.
+    """
+
+    def __init__(
+        self,
+        database_url: str,
+        security_service: MultiTenantSecurityService | Any,
+    ) -> None:
+        self.database_url = database_url
+        self.security_service = security_service
+
+    def _verify_token(self, jwt_token: str) -> JWTTokenPayload:
+        if hasattr(self.security_service, "verify_jwt"):
+            return self.security_service.verify_jwt(jwt_token)
+        if hasattr(self.security_service, "decode_and_verify_token"):
+            return self.security_service.decode_and_verify_token(jwt_token)
+        raise StorageError(
+            "Configured security_service must expose verify_jwt() or decode_and_verify_token()."
+        )
+
+    @contextmanager
+    def tenant_scoped_transaction(self, jwt_token: str) -> Iterator[Any]:
+        """
+        Verifies the user's JWT cryptographic signature and opens a PostgreSQL
+        transaction scoped strictly to `token_payload.sub` via RLS session variables.
+        """
+        if psycopg is None:
+            raise StorageError(
+                "psycopg (PostgreSQL driver) is not installed in the current runtime environment."
+            )
+        if not self.database_url or not self.database_url.strip():
+            raise StorageError("database_url must be a non-empty PostgreSQL connection URI.")
+
+        payload: JWTTokenPayload = self._verify_token(jwt_token)
+
+        with psycopg.connect(self.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT set_config('request.jwt.claim.sub', %s, true);",
+                    (str(payload.sub),),
+                )
+                yield cur
+            conn.commit()
+
+
+# =============================================================================
+# 6. F01 STATELESS GCS & LOCAL-FALLBACK STATE READER (60s TTL CACHE)
+# =============================================================================
+
+
+class StatelessGCSStateReader:
+    """
+    Thread-safe Single-Source-of-Truth reader for Cloud Run API containers.
+    Reads `state/virtual_portfolio.json`, `state/equity_curve.json`, and
+    `state/eod_telemetry.json` from Google Cloud Storage (`GCS_BUCKET_NAME` /
+    `SIRIX_GCS_BUCKET`), falling back transparently to local disk (`data/state/`
+    and `data/`), with a 60-second in-memory TTL cache and instant invalidation.
+    """
+
+    DEFAULT_CACHE_TTL_SECONDS: float = 60.0
+
+    def __init__(
+        self,
+        settings: Optional[SystemSettings] = None,
+        bucket_name: Optional[str] = None,
+        cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
+        gcs_client: Optional[Any] = None,
+        clock: Any = time.monotonic,
+    ) -> None:
+        self.settings: SystemSettings = settings or get_settings()
+        raw_bucket = (
+            bucket_name
+            if bucket_name is not None
+            else (
+                os.environ.get("GCS_BUCKET_NAME", "").strip()
+                or os.environ.get("SIRIX_GCS_BUCKET", "").strip()
+            )
+        )
+        self.bucket_name: Optional[str] = (
+            raw_bucket.removeprefix("gs://").strip("/") if raw_bucket else None
+        )
+        self.cache_ttl_seconds: float = max(0.0, float(cache_ttl_seconds))
+        self._gcs_client = gcs_client
+        self._clock = clock
+        self._lock = threading.RLock()
+        self._cache: Dict[str, Tuple[float, Any, Literal["GCS", "LOCAL_FALLBACK"]]] = {}
+
+        self.local_state_dir: Path = (self.settings.base_dir / "data" / "state").resolve()
+        self.local_data_dir: Path = (self.settings.base_dir / "data").resolve()
+
+    def active_backend(self) -> Literal["GCS", "LOCAL_FALLBACK"]:
+        """Returns the primary configured state backend identifier."""
+        if self.bucket_name and (self._gcs_client is not None or gcs_storage is not None):
+            return "GCS"
+        return "LOCAL_FALLBACK"
+
+    def _get_gcs_client(self) -> Optional[Any]:
+        if not self.bucket_name:
+            return None
+        if self._gcs_client is not None:
+            return self._gcs_client
+        if gcs_storage is None:
+            return None
+        try:
+            self._gcs_client = gcs_storage.Client()
+        except Exception as exc:
+            logger.warning(f"Failed to initialize GCS client; using local fallback if available: {exc}")
+            return None
+        return self._gcs_client
+
+    def invalidate_cache(self, object_name: Optional[str] = None) -> None:
+        """
+        Immediately clears cached state objects (all objects when `object_name` is None).
+        Invoked by `POST /api/internal/trigger-eod` upon EOD completion.
+        """
+        with self._lock:
+            if object_name is None:
+                self._cache.clear()
+            else:
+                self._cache.pop(object_name, None)
+
+    def _read_gcs_bytes(self, object_name: str) -> Optional[bytes]:
+        client = self._get_gcs_client()
+        if client is None or not self.bucket_name:
+            return None
+        try:
+            bucket = client.bucket(self.bucket_name)
+            blob = bucket.blob(object_name)
+            if not blob.exists():
+                return None
+            return bytes(blob.download_as_bytes())
+        except Exception as exc:
+            logger.warning(f"GCS read failed for gs://{self.bucket_name}/{object_name}: {exc}")
+            return None
+
+    def _default_local_candidates(self, object_name: str) -> List[Path]:
+        clean = object_name.strip("/")
+        basename = Path(clean).name
+        candidates: List[Path] = [
+            self.local_state_dir / basename,
+            self.local_data_dir / clean,
+            self.local_data_dir / basename,
+        ]
+        if basename == "virtual_portfolio.json":
+            candidates.insert(0, self.settings.virtual_portfolio_path)
+        deduped: List[Path] = []
+        seen: set[Path] = set()
+        for path in candidates:
+            resolved = path.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                deduped.append(resolved)
+        return deduped
+
+    def _parse_json_bytes(self, raw_bytes: bytes, source_label: str) -> Any:
+        try:
+            decoded_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise MalformedStateError(
+                f"State object '{source_label}' contains invalid UTF-8 bytes: {exc}"
+            ) from exc
+        try:
+            return json.loads(decoded_text)
+        except json.JSONDecodeError as exc:
+            raise MalformedStateError(
+                f"Malformed JSON in state object '{source_label}': {exc}"
+            ) from exc
+
+    def read_json(
+        self,
+        object_name: str,
+        local_fallbacks: Optional[Sequence[Path]] = None,
+        default: Optional[Any] = None,
+    ) -> Tuple[Any, Literal["GCS", "LOCAL_FALLBACK"]]:
+        """
+        Reads and parses JSON from GCS (preferred) or local filesystem with a 60s TTL cache.
+        Raises `MalformedStateError` if an existing artifact contains corrupt JSON.
+        """
+        now_ts = float(self._clock())
+        with self._lock:
+            cached = self._cache.get(object_name)
+            if cached is not None:
+                expires_at, cached_payload, cached_backend = cached
+                if now_ts < expires_at:
+                    return cached_payload, cached_backend
+
+            raw_gcs = self._read_gcs_bytes(object_name)
+            if raw_gcs is not None:
+                parsed = self._parse_json_bytes(raw_gcs, f"gs://{self.bucket_name}/{object_name}")
+                backend: Literal["GCS", "LOCAL_FALLBACK"] = "GCS"
+                self._cache[object_name] = (now_ts + self.cache_ttl_seconds, parsed, backend)
+                return parsed, backend
+
+            candidate_paths = (
+                list(local_fallbacks)
+                if local_fallbacks is not None
+                else self._default_local_candidates(object_name)
+            )
+            for candidate in candidate_paths:
+                if candidate.exists() and candidate.is_file():
+                    try:
+                        raw_bytes = candidate.read_bytes()
+                    except OSError as exc:
+                        raise MalformedStateError(
+                            f"Unable to read state file '{candidate}': {exc}"
+                        ) from exc
+                    parsed = self._parse_json_bytes(raw_bytes, str(candidate))
+                    backend = "LOCAL_FALLBACK"
+                    self._cache[object_name] = (now_ts + self.cache_ttl_seconds, parsed, backend)
+                    return parsed, backend
+
+            if default is not None:
+                fallback_backend = self.active_backend()
+                return default, fallback_backend
+
+            raise MalformedStateError(
+                f"Required state object '{object_name}' not found in GCS or local fallback directories."
+            )
+
+    def write_json_atomically(
+        self,
+        object_name: str,
+        payload: Any,
+        local_path: Optional[Path] = None,
+    ) -> Literal["GCS", "LOCAL_FALLBACK"]:
+        """
+        Serializes `payload` and persists atomically to GCS (if configured) and/or
+        local storage (`NamedTemporaryFile + fsync + os.replace`), invalidating cache.
+        """
+        serialized = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+        target_local = (
+            local_path.resolve()
+            if local_path is not None
+            else (self.local_state_dir / Path(object_name).name)
+        )
+
+        with self._lock:
+            backend_used: Literal["GCS", "LOCAL_FALLBACK"] = "LOCAL_FALLBACK"
+            client = self._get_gcs_client()
+            if client is not None and self.bucket_name:
+                try:
+                    bucket = client.bucket(self.bucket_name)
+                    clean_obj = object_name.strip("/")
+                    staging_blob = bucket.blob(f"{clean_obj}.tmp")
+                    staging_blob.cache_control = "no-store"
+                    staging_blob.upload_from_string(serialized, content_type="application/json")
+                    target_blob = bucket.blob(clean_obj)
+                    target_blob.cache_control = "no-store"
+                    bucket.copy_blob(staging_blob, bucket, clean_obj)
+                    try:
+                        staging_blob.delete()
+                    except Exception as cleanup_exc:
+                        logger.debug(f"GCS staging blob cleanup warning: {cleanup_exc}")
+                    backend_used = "GCS"
+                except Exception as exc:
+                    raise StorageError(
+                        f"Atomic GCS upload failed for gs://{self.bucket_name}/{object_name}: {exc}"
+                    ) from exc
+
+            JsonPortfolioStateRepository._write_text_atomically(target_local, serialized)
+            self._cache.pop(object_name, None)
+            return backend_used
+
+    def read_virtual_portfolio(self) -> Tuple[MultiTenantStateStoreSchema, Literal["GCS", "LOCAL_FALLBACK"]]:
+        """
+        Loads and strictly validates `state/virtual_portfolio.json` into
+        `MultiTenantStateStoreSchema`. Supports legacy single-ledger migration.
+        """
+        raw_obj, backend = self.read_json("state/virtual_portfolio.json")
+        if not isinstance(raw_obj, dict):
+            raise MalformedStateError("state/virtual_portfolio.json root must be a JSON object.")
+
+        try:
+            if "portfolio_id" in raw_obj and "tenant_portfolios" not in raw_obj:
+                single_ledger = VirtualPortfolioLedgerSchema.model_validate(raw_obj)
+                registry = load_index_registry(self.settings.index_registry_path)
+                state = MultiTenantStateStoreSchema(
+                    index_registry=registry,
+                    tenant_portfolios={single_ledger.portfolio_id: single_ledger},
+                )
+                return state, backend
+            return MultiTenantStateStoreSchema.model_validate(raw_obj), backend
+        except (ValidationError, ValueError, TypeError) as exc:
+            raise MalformedStateError(
+                f"Portfolio ledger failed Pydantic v2 contract validation: {exc}"
+            ) from exc
+
+    def read_equity_curve(self) -> Tuple[List[Dict[str, Any]], Literal["GCS", "LOCAL_FALLBACK"]]:
+        """
+        Loads `state/equity_curve.json` (accepting either a list of points or
+        `{"points": [...]}` wrapper), returning an empty list if not yet generated.
+        """
+        raw_obj, backend = self.read_json("state/equity_curve.json", default=[])
+        if isinstance(raw_obj, dict) and isinstance(raw_obj.get("points"), list):
+            return list(raw_obj["points"]), backend
+        if isinstance(raw_obj, list):
+            return list(raw_obj), backend
+        raise MalformedStateError("state/equity_curve.json must be a JSON array or {'points': [...]}.")
+
+    def read_eod_telemetry(self) -> Tuple[Dict[str, Any], Literal["GCS", "LOCAL_FALLBACK"]]:
+        """
+        Loads `state/eod_telemetry.json`, falling back to `eod_heartbeat.json`
+        if `eod_telemetry.json` has not been emitted yet.
+        """
+        telemetry_obj, backend = self.read_json("state/eod_telemetry.json", default={})
+        if isinstance(telemetry_obj, dict) and telemetry_obj:
+            return telemetry_obj, backend
+        if not isinstance(telemetry_obj, dict):
+            raise MalformedStateError("state/eod_telemetry.json root must be a JSON object.")
+
+        heartbeat_obj, hb_backend = self.read_json(
+            "state/eod_heartbeat.json",
+            local_fallbacks=[
+                self.local_state_dir / "eod_heartbeat.json",
+                self.local_data_dir / "eod_heartbeat.json",
+            ],
+            default={},
+        )
+        if not isinstance(heartbeat_obj, dict):
+            raise MalformedStateError("eod_heartbeat.json root must be a JSON object.")
+        return heartbeat_obj, hb_backend
+
+
 # Backward-compatible aliases used across existing modules
 BasePortfolioRepository = PortfolioStateRepository
 JsonFilePortfolioRepository = JsonPortfolioStateRepository
 AtomicStateRepository = JsonPortfolioStateRepository
+
