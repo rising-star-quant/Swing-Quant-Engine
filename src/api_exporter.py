@@ -162,11 +162,17 @@ class StateStorageAdapter:
         gcs_bucket_name: Optional[str] = None,
         local_data_dir: Optional[Path] = None,
     ) -> None:
-        env_bucket = os.environ.get("SIRIX_GCS_BUCKET", "").strip()
-        self.bucket_name: Optional[str] = (
+        env_bucket = (
+            os.environ.get("SIRIX_GCS_BUCKET", "").strip()
+            or os.environ.get("GCS_BUCKET_NAME", "").strip()
+        )
+        raw_bucket = (
             gcs_bucket_name.strip()
             if gcs_bucket_name and gcs_bucket_name.strip()
-            else (env_bucket if env_bucket else None)
+            else env_bucket
+        )
+        self.bucket_name: Optional[str] = (
+            raw_bucket.removeprefix("gs://").strip("/") if raw_bucket else None
         )
         base_dir = Path(__file__).resolve().parent.parent
         self.local_data_dir: Path = (
@@ -254,6 +260,7 @@ class StateStorageAdapter:
             blob_key = self._object_key(user_id, filename)
             try:
                 blob = bucket.blob(blob_key)
+                blob.cache_control = "no-store"
                 blob.upload_from_string(
                     json.dumps(payload, indent=2, ensure_ascii=False),
                     content_type="application/json",
@@ -267,22 +274,32 @@ class StateStorageAdapter:
     def read_user_json(self, user_id: str, filename: str) -> Optional[Any]:
         """
         Reads `users/{user_id}/{filename}` from GCS if configured, falling back
-        seamlessly to local `data/users/{user_id}/{filename}` or `data/{filename}`.
+        to `users/{PRIMARY_SIRIX_USER_ID}/{filename}` for shared EOD telemetry contracts,
+        and then to local `data/users/{user_id}/{filename}` or `data/{filename}`.
         """
         bucket = self._get_gcs_bucket()
         if bucket is not None:
-            blob_key = self._object_key(user_id, filename)
-            try:
-                blob = bucket.blob(blob_key)
-                if blob.exists():
-                    raw_bytes = blob.download_as_bytes()
-                    return json.loads(raw_bytes.decode("utf-8"))
-            except Exception as exc:
-                logger.debug(f"GCS read fallback for {blob_key}: {exc}")
+            candidate_keys = [self._object_key(user_id, filename)]
+            if user_id != PRIMARY_SIRIX_USER_ID and filename != "preferences.json":
+                candidate_keys.append(self._object_key(PRIMARY_SIRIX_USER_ID, filename))
+
+            for blob_key in candidate_keys:
+                try:
+                    blob = bucket.blob(blob_key)
+                    if blob.exists():
+                        raw_bytes = blob.download_as_bytes()
+                        return json.loads(raw_bytes.decode("utf-8"))
+                except Exception as exc:
+                    logger.debug(f"GCS read fallback for {blob_key}: {exc}")
 
         local_target = self._local_path(user_id, filename)
         if local_target.exists():
             return json.loads(local_target.read_text(encoding="utf-8"))
+
+        if user_id != PRIMARY_SIRIX_USER_ID and filename != "preferences.json":
+            primary_local = self._local_path(PRIMARY_SIRIX_USER_ID, filename)
+            if primary_local.exists():
+                return json.loads(primary_local.read_text(encoding="utf-8"))
 
         root_fallback = self.local_data_dir / filename
         if root_fallback.exists():

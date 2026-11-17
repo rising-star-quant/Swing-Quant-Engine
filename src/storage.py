@@ -956,11 +956,36 @@ class StatelessGCSStateReader:
     def read_virtual_portfolio(self) -> Tuple[MultiTenantStateStoreSchema, Literal["GCS", "LOCAL_FALLBACK"]]:
         """
         Loads and strictly validates `state/virtual_portfolio.json` into
-        `MultiTenantStateStoreSchema`. Supports legacy single-ledger migration.
+        `MultiTenantStateStoreSchema`. If neither GCS nor local state exists yet
+        (Day-1 cold start), returns a clean 100% initial cash ($100,000) portfolio.
         """
-        raw_obj, backend = self.read_json("state/virtual_portfolio.json")
+        raw_obj, backend = self.read_json("state/virtual_portfolio.json", default={})
         if not isinstance(raw_obj, dict):
             raise MalformedStateError("state/virtual_portfolio.json root must be a JSON object.")
+
+        if not raw_obj:
+            registry = load_index_registry(self.settings.index_registry_path)
+            active_indices = [idx_id for idx_id, cfg in registry.items() if cfg.is_active] or list(registry.keys())
+            default_ledger = VirtualPortfolioLedgerSchema(
+                portfolio_id=DEFAULT_ADMIN_PORTFOLIO_ID,
+                user_id=DEFAULT_ADMIN_USER_ID,
+                portfolio_name="Primary Swing Shadow Portfolio",
+                as_of_date=datetime.now(timezone.utc).date(),
+                cash_balance=100_000.0,
+                total_equity=100_000.0,
+                max_portfolio_heat_pct=self.settings.default_max_portfolio_heat_pct,
+                max_concurrent_positions=10,
+                subscribed_indices=active_indices,
+                open_positions={},
+                closed_trades_audit=[],
+            )
+            return (
+                MultiTenantStateStoreSchema(
+                    index_registry=registry,
+                    tenant_portfolios={DEFAULT_ADMIN_PORTFOLIO_ID: default_ledger},
+                ),
+                backend,
+            )
 
         try:
             if "portfolio_id" in raw_obj and "tenant_portfolios" not in raw_obj:

@@ -269,76 +269,25 @@ class PatchPreferencesRequestContract(BaseModel):
 
 def get_default_portfolio_seed() -> Dict[str, Any]:
     return {
-        "as_of_eod": "2026-11-13T21:00:00Z",
+        "as_of_eod": "2026-11-17T21:00:00Z",
         "market_status": "CLOSED",
-        "defensive_cash_mode": False,
+        "defensive_cash_mode": True,
         "summary": {
-            "total_equity": 104820.50,
-            "daily_change_amount": 1420.80,
-            "daily_change_pct": 1.37,
-            "inception_change_amount": 4820.50,
-            "inception_change_pct": 4.82,
-            "cash_balance": 18450.00,
-            "invested_value": 86370.50,
-            "portfolio_heat_pct": 5.4,
+            "total_equity": 100000.00,
+            "daily_change_amount": 0.00,
+            "daily_change_pct": 0.00,
+            "inception_change_amount": 0.00,
+            "inception_change_pct": 0.00,
+            "cash_balance": 100000.00,
+            "invested_value": 0.00,
+            "portfolio_heat_pct": 0.0,
             "max_portfolio_heat_pct": 6.0,
         },
         "audit_badge": {
-            "closed_trades_count": 6,
-            "win_rate_pct": 66.7,
+            "closed_trades_count": 0,
+            "win_rate_pct": 0.0,
         },
-        "holdings": [
-            {
-                "ticker": "SMCI",
-                "universe": "RUT",
-                "current_price": 53.90,
-                "position_value": 13475.00,
-                "unrealized_pnl_pct": 11.83,
-                "days_held": 6,
-                "max_days": 14,
-                "timeline_phase": "FRESH",
-            },
-            {
-                "ticker": "CELH",
-                "universe": "RUT",
-                "current_price": 34.10,
-                "position_value": 10230.00,
-                "unrealized_pnl_pct": 8.25,
-                "days_held": 12,
-                "max_days": 14,
-                "timeline_phase": "CRITICAL",
-            },
-            {
-                "ticker": "MEDP",
-                "universe": "MID",
-                "current_price": 362.50,
-                "position_value": 14500.00,
-                "unrealized_pnl_pct": 6.62,
-                "days_held": 9,
-                "max_days": 14,
-                "timeline_phase": "MATURING",
-            },
-            {
-                "ticker": "POWL",
-                "universe": "RUT",
-                "current_price": 176.80,
-                "position_value": 13260.00,
-                "unrealized_pnl_pct": 9.14,
-                "days_held": 5,
-                "max_days": 14,
-                "timeline_phase": "FRESH",
-            },
-            {
-                "ticker": "ONTO",
-                "universe": "MID",
-                "current_price": 197.40,
-                "position_value": 12831.00,
-                "unrealized_pnl_pct": 1.23,
-                "days_held": 2,
-                "max_days": 14,
-                "timeline_phase": "FRESH",
-            },
-        ],
+        "holdings": [],
         "truncated_count": 0,
     }
 
@@ -1028,6 +977,7 @@ async def auth_logout(request: Request, response: Response) -> Dict[str, str]:
 
 
 @app.get("/api/v1/portfolio", response_model=PortfolioOverviewResponseContract)
+@app.get("/api/v1/portfolio/overview", response_model=PortfolioOverviewResponseContract)
 async def get_portfolio_overview(
     current_user: CurrentUserClaims = Depends(get_current_user),
     storage: StateStorageAdapter = Depends(get_storage_adapter),
@@ -1075,7 +1025,7 @@ async def get_portfolio_overview(
         truncated_count = 0
 
     return PortfolioOverviewResponseContract(
-        as_of_eod=str(raw_state.get("as_of_eod", "2026-11-13T21:00:00Z")),
+        as_of_eod=str(raw_state.get("as_of_eod", "2026-11-17T21:00:00Z")),
         market_status=raw_state.get("market_status", "CLOSED"),
         defensive_cash_mode=defensive_cash_mode,
         summary=PortfolioSummaryContract.model_validate(raw_state["summary"]),

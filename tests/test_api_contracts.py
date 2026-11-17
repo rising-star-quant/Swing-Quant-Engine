@@ -30,10 +30,46 @@ from src.schemas import VirtualPortfolioLedgerSchema
 @pytest.fixture()
 def isolated_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> StateStorageAdapter:
     monkeypatch.delenv("SIRIX_GCS_BUCKET", raising=False)
+    monkeypatch.delenv("GCS_BUCKET_NAME", raising=False)
     adapter = StateStorageAdapter(gcs_bucket_name=None, local_data_dir=tmp_path)
 
+    # Verify the production cold-start seed is a clean Day-1 empty slate
+    clean_day1_seed = get_default_portfolio_seed()
+    assert clean_day1_seed["holdings"] == []
+    assert clean_day1_seed["defensive_cash_mode"] is True
+    assert clean_day1_seed["summary"]["cash_balance"] == 100000.0
+    assert clean_day1_seed["summary"]["total_equity"] == 100000.0
+    assert clean_day1_seed["summary"]["invested_value"] == 0.0
+    assert clean_day1_seed["audit_badge"]["closed_trades_count"] == 0
+
+    sample_holdings_fixture = {
+        **clean_day1_seed,
+        "defensive_cash_mode": False,
+        "holdings": [
+            {
+                "ticker": tkr,
+                "company_name": f"{tkr} Holdings Inc.",
+                "universe": "RUT",
+                "shares": 100.0,
+                "entry_price": 100.0,
+                "current_price": 105.0,
+                "market_value": 10500.0,
+                "unrealized_pnl_amount": 500.0,
+                "unrealized_pnl_pct": 5.0,
+                "days_held": 3,
+                "max_hold_days": 14,
+                "timeline_phase": "FRESH",
+                "stop_loss_price": 95.0,
+                "take_profit_price": 115.0,
+                "atr_14": 2.5,
+                "composite_score": 88.0,
+            }
+            for tkr in ("SMCI", "DUOL", "CELH", "ONTO", "ELF")
+        ],
+    }
+
     for uid in (PRIMARY_SIRIX_USER_ID, "usr_sirix_pro", "usr_sirix_free"):
-        adapter.write_user_json(uid, "portfolio_state.json", get_default_portfolio_seed())
+        adapter.write_user_json(uid, "portfolio_state.json", sample_holdings_fixture)
         adapter.write_user_json(uid, "positions_detail.json", get_default_positions_seed())
         adapter.write_user_json(uid, "audit_log.json", get_default_audit_log_seed())
         adapter.write_user_json(uid, "scan_rejections.json", get_default_rejections_seed())

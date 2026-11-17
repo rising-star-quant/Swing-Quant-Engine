@@ -89,6 +89,31 @@ jobs:
           INTERNAL_SCHEDULER_TOKEN: ${{ secrets.INTERNAL_SCHEDULER_TOKEN }}
           SIRIX_CLOUD_RUN_URL: ${{ vars.SIRIX_CLOUD_RUN_URL || secrets.SIRIX_CLOUD_RUN_URL }}
         run: |
+          # Hydrate data/virtual_portfolio.json from GCS if absent locally (e.g., stateless runner)
+          python - <<'PY'
+          import json
+          import logging
+          import os
+          from pathlib import Path
+          from src.storage import StatelessGCSStateReader
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger("SIRIX.GHA.GCSHydrate")
+
+          vp_path = Path("data/virtual_portfolio.json")
+          bucket_name = (os.environ.get("SIRIX_GCS_BUCKET") or os.environ.get("GCS_BUCKET_NAME") or "").strip()
+          if not vp_path.is_file() and bucket_name:
+              reader = StatelessGCSStateReader(bucket_name=bucket_name)
+              try:
+                  raw = reader._fetch_raw_bytes("state/virtual_portfolio.json")
+                  if raw is not None:
+                      vp_path.parent.mkdir(parents=True, exist_ok=True)
+                      vp_path.write_text(raw.decode("utf-8"), encoding="utf-8")
+                      logger.info("Hydrated data/virtual_portfolio.json from gs://%s/state/virtual_portfolio.json", reader.bucket_name)
+              except Exception as exc:
+                  logger.info("No prior GCS state found (clean Day-1 initialization): %s", exc)
+          PY
+
           ARGS=("--mode" "daily")
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS+=("--dry-run")
