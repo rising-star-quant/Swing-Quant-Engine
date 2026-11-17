@@ -3,7 +3,7 @@ name: Swing Quant Engine — Autonomous Daily EOD Pipeline
 on:
   schedule:
     # Runs at 21:30 UTC Monday–Friday (immediately post-US market close: 16:30 EST / 17:30 EDT)
-    - cron: '30 21 * * 1-5'
+    - cron: '45 21 * * 1-5'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -29,7 +29,7 @@ jobs:
   run-quant-engine:
     name: Autonomous EOD Screening, Triple-Barrier & Ledger Sync
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
 
     steps:
       - name: Checkout Repository
