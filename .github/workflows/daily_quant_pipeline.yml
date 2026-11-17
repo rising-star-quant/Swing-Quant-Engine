@@ -2,7 +2,7 @@ name: Swing Quant Engine — Autonomous Daily EOD Pipeline
 
 on:
   schedule:
-    # Runs at 21:30 UTC Monday–Friday (immediately post-US market close: 16:30 EST / 17:30 EDT)
+    # Runs at 21:45 UTC Monday–Friday (23:45 IST, after US market close & settlement)
     - cron: '45 21 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -59,6 +59,12 @@ jobs:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
+      - name: Authenticate to Google Cloud via Service Account Key (Fallback)
+        if: ${{ (vars.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || vars.GCP_SERVICE_ACCOUNT == '') && secrets.GCP_SA_KEY != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
       - name: Gate 0 — Pre-Flight System Integrity Audit
         run: python scripts/verify_system.py
 
@@ -78,7 +84,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
-          SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
+          SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
+          GCS_BUCKET_NAME: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
+          INTERNAL_SCHEDULER_TOKEN: ${{ secrets.INTERNAL_SCHEDULER_TOKEN }}
+          SIRIX_CLOUD_RUN_URL: ${{ vars.SIRIX_CLOUD_RUN_URL || secrets.SIRIX_CLOUD_RUN_URL }}
         run: |
           ARGS=("--mode" "daily")
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
@@ -88,6 +97,44 @@ jobs:
             ARGS+=("--date" "${{ github.event.inputs.target_date }}")
           fi
           python -m src.main "${ARGS[@]}"
+
+          # Synchronize canonical F01 state artifacts (state/virtual_portfolio.json & state/eod_telemetry.json) to GCS
+          if [ "${{ github.event.inputs.dry_run }}" != "true" ]; then
+            python - <<'PY'
+          import json
+          import logging
+          import os
+          from pathlib import Path
+          from src.storage import StatelessGCSStateReader
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger("SIRIX.GHA.GCSSync")
+
+          bucket_name = (os.environ.get("SIRIX_GCS_BUCKET") or os.environ.get("GCS_BUCKET_NAME") or "").strip()
+          if bucket_name:
+              reader = StatelessGCSStateReader(bucket_name=bucket_name)
+              vp_path = Path("data/virtual_portfolio.json")
+              hb_path = Path("data/eod_heartbeat.json")
+              try:
+                  if vp_path.is_file():
+                      vp_payload = json.loads(vp_path.read_text(encoding="utf-8"))
+                      backend = reader.write_json_atomically("state/virtual_portfolio.json", vp_payload)
+                      logger.info("Synced state/virtual_portfolio.json via backend=%s", backend)
+                  if hb_path.is_file():
+                      hb_payload = json.loads(hb_path.read_text(encoding="utf-8"))
+                      reader.write_json_atomically("state/eod_telemetry.json", hb_payload)
+                      reader.write_json_atomically("state/eod_heartbeat.json", hb_payload)
+                      logger.info("Synced state/eod_telemetry.json and state/eod_heartbeat.json")
+              except Exception as exc:
+                  logger.warning("GCS state sync skipped or deferred to local commit: %s", exc)
+          PY
+
+            # Trigger Cloud Run in-memory TTL cache invalidation if endpoint & token are configured
+            if [ -n "${SIRIX_CLOUD_RUN_URL:-}" ] && [ -n "${INTERNAL_SCHEDULER_TOKEN:-}" ]; then
+              curl -fsS -X POST "${SIRIX_CLOUD_RUN_URL%/}/api/internal/trigger-eod" \
+                -H "X-Sirix-Scheduler-Token: ${INTERNAL_SCHEDULER_TOKEN}" || true
+            fi
+          fi
 
       - name: Gate 3 — Atomic Virtual Ledger Persistence Commit
         if: ${{ success() && github.event.inputs.dry_run != 'true' }}
@@ -110,4 +157,3 @@ jobs:
             git pull --rebase origin "${GITHUB_REF_NAME}"
             git push origin HEAD:"${GITHUB_REF_NAME}"
           fi
-
