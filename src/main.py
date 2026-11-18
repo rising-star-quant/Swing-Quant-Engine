@@ -12,6 +12,8 @@ import sys
 from tempfile import NamedTemporaryFile
 import time
 from typing import Any, Dict, IO, List, Optional, Set, Tuple
+import urllib.error
+import urllib.request
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -57,6 +59,7 @@ try:
         MarketDataRepository,
         ParquetMarketDataRepository,
         PortfolioStateRepository,
+        StatelessGCSStateReader,
     )
     from src.api_exporter import (
         PRIMARY_SIRIX_USER_ID,
@@ -98,6 +101,7 @@ except ImportError:
         MarketDataRepository,
         ParquetMarketDataRepository,
         PortfolioStateRepository,
+        StatelessGCSStateReader,
     )
     from api_exporter import (  # type: ignore[no-redef]
         PRIMARY_SIRIX_USER_ID,
@@ -674,6 +678,147 @@ class QuantPipelineOrchestrator:
 
         raise SettlementDataDelayError("FAILED_DATA_DELAY: Exhausted settlement retry loop.")
 
+    def _sync_canonical_state_to_gcs(
+        self,
+        virtual_portfolio_payload: Dict[str, Any],
+        equity_curve_payload: List[Dict[str, Any]],
+        telemetry_payload: Dict[str, Any],
+        strict_gcs: bool = False,
+    ) -> str:
+        """
+        Atomically writes and synchronizes the 4 canonical F01 state files:
+        - `state/virtual_portfolio.json`
+        - `state/equity_curve.json`
+        - `state/eod_telemetry.json`
+        - `state/eod_heartbeat.json`
+        to both local `data/` + `data/state/` and `gs://$GCS_BUCKET_NAME/state/`.
+        """
+        data_dir = self.settings.virtual_portfolio_path.parent
+        state_dir = data_dir / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        atomic_write_json(data_dir / "equity_curve.json", {"points": equity_curve_payload})
+        atomic_write_json(state_dir / "equity_curve.json", {"points": equity_curve_payload})
+        atomic_write_json(data_dir / "eod_telemetry.json", telemetry_payload)
+        atomic_write_json(state_dir / "eod_telemetry.json", telemetry_payload)
+        atomic_write_json(data_dir / "eod_heartbeat.json", telemetry_payload)
+        atomic_write_json(state_dir / "eod_heartbeat.json", telemetry_payload)
+
+        bucket_name = (
+            os.environ.get("GCS_BUCKET_NAME", "").strip()
+            or os.environ.get("SIRIX_GCS_BUCKET", "").strip()
+        )
+        reader = StatelessGCSStateReader(
+            settings=self.settings,
+            bucket_name=bucket_name if bucket_name else None,
+        )
+
+        backend_used = "LOCAL_FALLBACK"
+        try:
+            b1 = reader.write_json_atomically(
+                "state/virtual_portfolio.json",
+                virtual_portfolio_payload,
+                local_path=state_dir / "virtual_portfolio.json",
+            )
+            b2 = reader.write_json_atomically(
+                "state/equity_curve.json",
+                equity_curve_payload,
+                local_path=state_dir / "equity_curve.json",
+            )
+            b3 = reader.write_json_atomically(
+                "state/eod_telemetry.json",
+                telemetry_payload,
+                local_path=state_dir / "eod_telemetry.json",
+            )
+            b4 = reader.write_json_atomically(
+                "state/eod_heartbeat.json",
+                telemetry_payload,
+                local_path=state_dir / "eod_heartbeat.json",
+            )
+            if "GCS" in (b1, b2, b3, b4):
+                backend_used = "GCS"
+                self.logger.info(
+                    f"Atomically synchronized state/virtual_portfolio.json, state/equity_curve.json, "
+                    f"state/eod_telemetry.json, and state/eod_heartbeat.json to gs://{reader.bucket_name}/state/."
+                )
+        except Exception as exc:
+            if strict_gcs and bucket_name:
+                raise RuntimeError(
+                    f"GCS_SYNC_FAILED: Failed to upload canonical state files to gs://{bucket_name}/state/: {exc}"
+                ) from exc
+            self.logger.warning(
+                f"GCS state synchronization warning (local state artifacts saved to {state_dir}): {exc}"
+            )
+
+        return backend_used
+
+    def trigger_cloud_run_cache_invalidation(
+        self,
+        cloud_run_url: Optional[str] = None,
+        scheduler_token: Optional[str] = None,
+        strict: bool = False,
+    ) -> bool:
+        """
+        Triggers an authenticated HTTP POST request to `<cloud_run_url>/api/internal/trigger-eod`
+        with header `X-Sirix-Scheduler-Token` to immediately flush the 60-second in-memory
+        GCS TTL cache on the live Cloud Run container.
+        """
+        resolved_url = (
+            cloud_run_url
+            or os.environ.get("SIRIX_CLOUD_RUN_URL", "")
+            or os.environ.get("CLOUD_RUN_URL", "")
+        ).strip().rstrip("/")
+        resolved_token = (
+            scheduler_token
+            or os.environ.get("INTERNAL_SCHEDULER_TOKEN", "")
+        ).strip()
+
+        if not resolved_url or not resolved_token:
+            self.logger.info(
+                "Cloud Run cache invalidation webhook skipped (SIRIX_CLOUD_RUN_URL or INTERNAL_SCHEDULER_TOKEN not set)."
+            )
+            return False
+
+        endpoint = f"{resolved_url}/api/internal/trigger-eod"
+        req = urllib.request.Request(
+            endpoint,
+            data=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-Sirix-Scheduler-Token": resolved_token,
+                "User-Agent": "SIRIX-QuantEngine-CI/2.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                status_code = resp.getcode()
+                body_text = resp.read().decode("utf-8", errors="replace")
+                if status_code in (200, 202):
+                    self.logger.info(
+                        f"Cloud Run TTL cache invalidated via {endpoint} (HTTP {status_code}): {body_text}"
+                    )
+                    return True
+                msg = f"Unexpected HTTP {status_code} from {endpoint}: {body_text}"
+                if strict:
+                    raise RuntimeError(msg)
+                self.logger.warning(msg)
+                return False
+        except urllib.error.HTTPError as http_err:
+            err_body = http_err.read().decode("utf-8", errors="replace")
+            msg = f"Cloud Run cache invalidation failed ({endpoint} returned HTTP {http_err.code}): {err_body}"
+            if strict:
+                raise RuntimeError(msg) from http_err
+            self.logger.warning(msg)
+            return False
+        except Exception as exc:
+            msg = f"Cloud Run cache invalidation request to {endpoint} failed: {exc}"
+            if strict:
+                raise RuntimeError(msg) from exc
+            self.logger.warning(msg)
+            return False
+
     def _persist_production_state_and_heartbeat(
         self,
         state: MultiTenantStateStoreSchema,
@@ -710,11 +855,12 @@ class QuantPipelineOrchestrator:
                 round(primary_ledger.total_equity, 2) if primary_ledger is not None else 0.0
             )
             now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            fallback_heartbeat = {
+            heartbeat_payload = {
                 "last_successful_eod_timestamp": now_iso,
                 "last_updated_utc": now_iso,
                 "eod_status": "HEALTHY",
                 "trading_date": target_date.isoformat(),
+                "last_trading_date_processed": target_date.isoformat(),
                 "current_portfolio_heat_pct": heat_pct,
                 "portfolio_heat_pct": heat_pct,
                 "open_positions_count": open_positions_count,
@@ -722,7 +868,7 @@ class QuantPipelineOrchestrator:
             }
             atomic_write_json(
                 self.settings.virtual_portfolio_path.parent / "eod_heartbeat.json",
-                fallback_heartbeat,
+                heartbeat_payload,
             )
 
         self.logger.info(
@@ -1027,7 +1173,6 @@ class QuantPipelineOrchestrator:
         finally:
             self._release_pipeline_lock(lock_fh)
 
-
     def reset_portfolio_baseline_and_rearm_kill_switch(
         self,
         as_of_date: Optional[date] = None,
@@ -1039,9 +1184,11 @@ class QuantPipelineOrchestrator:
         2. Restores cash_balance and total_equity to `initial_equity` ($100,000.00) with 0.0% heat.
         3. Re-arms `kill_switch_active = False` (ARMED_READY) across all user preference profiles
            and ensures core trading universes (`RUT_2000`, `SP_400`) are active.
-        4. Atomically persists `virtual_portfolio.json`, `eod_heartbeat.json`, and GCS telemetry
-           snapshots (`portfolio_state.json`, `positions_detail.json`, `audit_log.json`,
-           `scan_rejections.json`, and `preferences.json`).
+        4. Atomically persists and syncs `virtual_portfolio.json`, `equity_curve.json`,
+           `eod_telemetry.json`, and `eod_heartbeat.json` to `gs://$GCS_BUCKET_NAME/state/`,
+           exports user-scoped F01 telemetry snapshots (`portfolio_state.json`, `positions_detail.json`,
+           `audit_log.json`, `scan_rejections.json`, `preferences.json`), and triggers
+           the Cloud Run `/api/internal/trigger-eod` cache invalidation webhook.
         """
         target_date: date = as_of_date or datetime.now(timezone.utc).date()
         effective_dry_run = self._is_effective_dry_run()
@@ -1115,30 +1262,38 @@ class QuantPipelineOrchestrator:
                     target_date=target_date,
                 )
 
-                heartbeat_path = self.settings.virtual_portfolio_path.parent / "eod_heartbeat.json"
-                if heartbeat_path.is_file():
-                    try:
-                        hb_data = json.loads(heartbeat_path.read_text(encoding="utf-8"))
-                    except Exception:
-                        hb_data = {}
-                else:
-                    hb_data = {}
                 now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-                hb_data.update(
+                reset_telemetry_payload: Dict[str, Any] = {
+                    "last_successful_eod_timestamp": now_iso,
+                    "last_updated_utc": now_iso,
+                    "eod_status": "HEALTHY",
+                    "kill_switch_status": "ARMED_READY",
+                    "kill_switch_active": False,
+                    "trading_date": target_date.isoformat(),
+                    "last_trading_date_processed": target_date.isoformat(),
+                    "current_portfolio_heat_pct": 0.0,
+                    "portfolio_heat_pct": 0.0,
+                    "open_positions_count": 0,
+                    "total_equity": round(float(initial_equity), 2),
+                    "cash_balance": round(float(initial_equity), 2),
+                    "failure_reason": None,
+                }
+                reset_equity_curve_payload: List[Dict[str, Any]] = [
                     {
-                        "last_successful_eod_timestamp": now_iso,
-                        "last_updated_utc": now_iso,
-                        "eod_status": "HEALTHY",
-                        "kill_switch_status": "ARMED_READY",
-                        "kill_switch_active": False,
-                        "trading_date": target_date.isoformat(),
-                        "current_portfolio_heat_pct": 0.0,
-                        "portfolio_heat_pct": 0.0,
-                        "open_positions_count": 0,
-                        "total_equity": round(float(initial_equity), 2),
+                        "date": target_date.isoformat(),
+                        "portfolio_nav": round(float(initial_equity), 2),
+                        "benchmark_iwm_norm": 100.0,
+                        "benchmark_mdy_norm": 100.0,
+                        "heat_pct": 0.0,
                     }
+                ]
+                virtual_portfolio_dict = json.loads(reset_state.model_dump_json())
+
+                self._sync_canonical_state_to_gcs(
+                    virtual_portfolio_payload=virtual_portfolio_dict,
+                    equity_curve_payload=reset_equity_curve_payload,
+                    telemetry_payload=reset_telemetry_payload,
                 )
-                atomic_write_json(heartbeat_path, hb_data)
 
                 storage_adapter = self.cloud_exporter.storage
                 target_user_ids = (PRIMARY_SIRIX_USER_ID, "usr_sirix_pro", "usr_sirix_free")
@@ -1173,6 +1328,8 @@ class QuantPipelineOrchestrator:
                             as_of_date=target_date,
                             initial_equity=initial_equity,
                         )
+
+                self.trigger_cloud_run_cache_invalidation()
 
                 if self.notifier.is_configured:
                     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

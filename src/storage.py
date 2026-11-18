@@ -825,6 +825,10 @@ class StatelessGCSStateReader:
             logger.warning(f"GCS read failed for gs://{self.bucket_name}/{object_name}: {exc}")
             return None
 
+    def _fetch_raw_bytes(self, object_name: str) -> Optional[bytes]:
+        """Alias for `_read_gcs_bytes` used by CI/CD state hydration hooks."""
+        return self._read_gcs_bytes(object_name)
+
     def _default_local_candidates(self, object_name: str) -> List[Path]:
         clean = object_name.strip("/")
         basename = Path(clean).name
