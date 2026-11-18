@@ -1000,13 +1000,14 @@ async def get_portfolio_overview(
     computed_holdings: List[HoldingItemContract] = []
     for item in raw_holdings:
         days_held = int(item.get("days_held", 1))
-        max_days = int(item.get("max_days", 14))
+        max_days = int(item.get("max_days", item.get("max_hold_days", 14)))
+        pos_val = item.get("position_value", item.get("market_value", 0.0))
         computed_holdings.append(
             HoldingItemContract(
                 ticker=str(item["ticker"]).upper(),
                 universe=item.get("universe", "RUT"),
                 current_price=float(item["current_price"]),
-                position_value=float(item["position_value"]),
+                position_value=float(pos_val),
                 unrealized_pnl_pct=float(item["unrealized_pnl_pct"]),
                 days_held=days_held,
                 max_days=max_days,

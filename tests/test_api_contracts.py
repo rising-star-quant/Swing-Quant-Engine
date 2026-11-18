@@ -48,21 +48,13 @@ def isolated_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> StateSt
         "holdings": [
             {
                 "ticker": tkr,
-                "company_name": f"{tkr} Holdings Inc.",
                 "universe": "RUT",
-                "shares": 100.0,
-                "entry_price": 100.0,
                 "current_price": 105.0,
-                "market_value": 10500.0,
-                "unrealized_pnl_amount": 500.0,
+                "position_value": 10500.0,
                 "unrealized_pnl_pct": 5.0,
                 "days_held": 3,
-                "max_hold_days": 14,
+                "max_days": 14,
                 "timeline_phase": "FRESH",
-                "stop_loss_price": 95.0,
-                "take_profit_price": 115.0,
-                "atr_14": 2.5,
-                "composite_score": 88.0,
             }
             for tkr in ("SMCI", "DUOL", "CELH", "ONTO", "ELF")
         ],
