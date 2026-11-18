@@ -1028,9 +1028,190 @@ class QuantPipelineOrchestrator:
             self._release_pipeline_lock(lock_fh)
 
 
+    def reset_portfolio_baseline_and_rearm_kill_switch(
+        self,
+        as_of_date: Optional[date] = None,
+        initial_equity: float = 100_000.0,
+    ) -> Dict[str, Any]:
+        """
+        Operator-Controlled Portfolio Baseline Reset & Kill-Switch Re-Arming:
+        1. Clears all open positions and historical closed trade records across tenant portfolios.
+        2. Restores cash_balance and total_equity to `initial_equity` ($100,000.00) with 0.0% heat.
+        3. Re-arms `kill_switch_active = False` (ARMED_READY) across all user preference profiles
+           and ensures core trading universes (`RUT_2000`, `SP_400`) are active.
+        4. Atomically persists `virtual_portfolio.json`, `eod_heartbeat.json`, and GCS telemetry
+           snapshots (`portfolio_state.json`, `positions_detail.json`, `audit_log.json`,
+           `scan_rejections.json`, and `preferences.json`).
+        """
+        target_date: date = as_of_date or datetime.now(timezone.utc).date()
+        effective_dry_run = self._is_effective_dry_run()
+        lock_fh: Optional[IO[str]] = None
+
+        self.logger.info(
+            f"=== Starting Portfolio Baseline Reset & Kill-Switch Re-Arming "
+            f"(target_date={target_date}, baseline_equity=${initial_equity:,.2f}, dry_run={effective_dry_run}) ==="
+        )
+
+        try:
+            lock_fh = self._acquire_pipeline_lock()
+
+            state = self.state_repo.load_state()
+            if self.settings.index_registry_path.is_file():
+                registry = load_index_registry(self.settings.index_registry_path)
+            else:
+                registry = dict(state.index_registry)
+
+            rearmed_registry: Dict[str, IndexConfigSchema] = {}
+            for idx_id, cfg in registry.items():
+                should_activate = True if idx_id in ("RUT_2000", "SP_400") else cfg.is_active
+                rearmed_registry[idx_id] = cfg.model_copy(update={"is_active": should_activate})
+
+            active_index_ids = [
+                idx_id for idx_id, cfg in rearmed_registry.items() if cfg.is_active
+            ] or ["RUT_2000", "SP_400"]
+
+            reset_portfolios: Dict[UUID, VirtualPortfolioLedgerSchema] = {}
+            if state.tenant_portfolios:
+                for pid, existing_ledger in state.tenant_portfolios.items():
+                    reset_portfolios[pid] = VirtualPortfolioLedgerSchema(
+                        portfolio_id=existing_ledger.portfolio_id,
+                        user_id=existing_ledger.user_id,
+                        portfolio_name=existing_ledger.portfolio_name,
+                        as_of_date=target_date,
+                        cash_balance=round(float(initial_equity), 2),
+                        total_equity=round(float(initial_equity), 2),
+                        max_portfolio_heat_pct=existing_ledger.max_portfolio_heat_pct,
+                        max_concurrent_positions=existing_ledger.max_concurrent_positions,
+                        subscribed_indices=active_index_ids,
+                        open_positions={},
+                        closed_trades_audit=[],
+                    )
+            else:
+                default_ledger = VirtualPortfolioLedgerSchema(
+                    portfolio_id=DEFAULT_ADMIN_PORTFOLIO_ID,
+                    user_id=DEFAULT_ADMIN_USER_ID,
+                    portfolio_name="Primary Swing Shadow Portfolio",
+                    as_of_date=target_date,
+                    cash_balance=round(float(initial_equity), 2),
+                    total_equity=round(float(initial_equity), 2),
+                    max_portfolio_heat_pct=self.settings.default_max_portfolio_heat_pct,
+                    max_concurrent_positions=10,
+                    subscribed_indices=active_index_ids,
+                    open_positions={},
+                    closed_trades_audit=[],
+                )
+                reset_portfolios[default_ledger.portfolio_id] = default_ledger
+
+            reset_state = MultiTenantStateStoreSchema(
+                schema_version=state.schema_version,
+                last_updated_utc=datetime.now(timezone.utc),
+                index_registry=rearmed_registry,
+                tenant_portfolios=reset_portfolios,
+            )
+
+            if not effective_dry_run:
+                self._persist_production_state_and_heartbeat(
+                    state=reset_state,
+                    target_date=target_date,
+                )
+
+                heartbeat_path = self.settings.virtual_portfolio_path.parent / "eod_heartbeat.json"
+                if heartbeat_path.is_file():
+                    try:
+                        hb_data = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        hb_data = {}
+                else:
+                    hb_data = {}
+                now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                hb_data.update(
+                    {
+                        "last_successful_eod_timestamp": now_iso,
+                        "last_updated_utc": now_iso,
+                        "eod_status": "HEALTHY",
+                        "kill_switch_status": "ARMED_READY",
+                        "kill_switch_active": False,
+                        "trading_date": target_date.isoformat(),
+                        "current_portfolio_heat_pct": 0.0,
+                        "portfolio_heat_pct": 0.0,
+                        "open_positions_count": 0,
+                        "total_equity": round(float(initial_equity), 2),
+                    }
+                )
+                atomic_write_json(heartbeat_path, hb_data)
+
+                storage_adapter = self.cloud_exporter.storage
+                target_user_ids = (PRIMARY_SIRIX_USER_ID, "usr_sirix_pro", "usr_sirix_free")
+
+                for uid in target_user_ids:
+                    existing_prefs = load_user_guardrails(
+                        user_id=uid,
+                        local_data_dir=storage_adapter.local_data_dir,
+                    )
+                    rearmed_guardrails = existing_prefs.guardrails.model_copy(
+                        update={
+                            "kill_switch_active": False,
+                            "zero_override_enforced": True,
+                        }
+                    )
+                    rearmed_prefs = existing_prefs.model_copy(
+                        update={"guardrails": rearmed_guardrails}
+                    )
+                    storage_adapter.write_user_json(
+                        uid,
+                        "preferences.json",
+                        rearmed_prefs.model_dump(mode="json"),
+                    )
+
+                for reset_ledger in reset_state.tenant_portfolios.values():
+                    for uid in target_user_ids:
+                        self.cloud_exporter.export_all(
+                            ledger=reset_ledger,
+                            user_id=uid,
+                            approved_signals=[],
+                            vetoed_signals=[],
+                            as_of_date=target_date,
+                            initial_equity=initial_equity,
+                        )
+
+                if self.notifier.is_configured:
+                    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    chat_id = str(getattr(self.settings, "telegram_chat_id", "") or "").strip()
+                    reset_msg = (
+                        f"🔄 <b>SIRIX PORTFOLIO BASELINE RESET &amp; RE-ARMED</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"<b>UTC Timestamp:</b> <code>{now_str}</code>\n"
+                        f"<b>Settlement Date:</b> <code>{target_date.isoformat()}</code>\n"
+                        f"<b>Total Equity:</b> <code>${initial_equity:,.2f}</code>\n"
+                        f"<b>Cash Balance:</b> <code>${initial_equity:,.2f} (100.0%)</code>\n"
+                        f"<b>Open Positions:</b> <code>0 (0.00% Heat)</code>\n"
+                        f"<b>Kill-Switch Status:</b> <code>ARMED_READY</code>"
+                    )
+                    self.notifier._send_html_payload(chat_id=chat_id, text=reset_msg)
+
+            self.logger.info(
+                f"Portfolio Baseline Reset & Kill-Switch Re-Arming completed "
+                f"(equity=${initial_equity:,.2f}, open_positions=0, heat=0.0%, kill_switch=ARMED_READY)."
+            )
+            return {
+                "as_of_date": target_date,
+                "total_equity": round(float(initial_equity), 2),
+                "cash_balance": round(float(initial_equity), 2),
+                "open_positions_count": 0,
+                "portfolio_heat_pct": 0.0,
+                "kill_switch_status": "ARMED_READY",
+                "kill_switch_active": False,
+                "state": reset_state,
+            }
+        finally:
+            self._release_pipeline_lock(lock_fh)
+
+
 # =============================================================================
 # 4. CLI ENTRYPOINT
 # =============================================================================
+
+RESET_CONFIRMATION_PHRASE = "RESET_PORTFOLIO_100K"
 
 
 def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -1039,9 +1220,20 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["daily", "eod", "sandbox"],
+        choices=["daily", "eod", "sandbox", "reset"],
         default="daily",
-        help="Execution mode: 'eod'/'daily' production/dry-run worker or 'sandbox' end-to-end harness.",
+        help="Execution mode: 'eod'/'daily' production worker, 'sandbox' harness, or 'reset' baseline reset.",
+    )
+    parser.add_argument(
+        "--reset-portfolio",
+        action="store_true",
+        help="Execute operator-controlled $100,000.00 portfolio baseline reset and re-arm kill-switch.",
+    )
+    parser.add_argument(
+        "--confirm-reset",
+        type=str,
+        default=None,
+        help=f"Explicit operator confirmation token ('{RESET_CONFIRMATION_PHRASE}') required for portfolio reset.",
     )
     parser.add_argument(
         "--date",
@@ -1111,6 +1303,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         settings = base_settings
 
     configure_logging(settings.log_level)
+    logger = logging.getLogger("SwingQuantEngine.Orchestrator")
 
     target_date: Optional[date] = date.fromisoformat(args.date) if args.date else None
     cli_force_override: Optional[bool] = True if args.force_run else None
@@ -1129,6 +1322,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             as_of_date=target_date,
         )
 
+    if args.mode == "reset" or args.reset_portfolio:
+        confirm_token = (
+            args.confirm_reset or os.getenv("CONFIRM_RESET", "")
+        ).strip()
+        if confirm_token != RESET_CONFIRMATION_PHRASE:
+            logger.error(
+                f"PORTFOLIO_RESET_ABORTED: Missing or invalid confirmation phrase. "
+                f"Pass --confirm-reset {RESET_CONFIRMATION_PHRASE} to authorize baseline reset."
+            )
+            return 1
+        orchestrator = QuantPipelineOrchestrator(settings=settings)
+        orchestrator.reset_portfolio_baseline_and_rearm_kill_switch(
+            as_of_date=target_date,
+            initial_equity=100_000.0,
+        )
+        return 0
+
     if args.mode == "sandbox":
         try:
             from src.sandbox_runner import SandboxDryRunHarness
@@ -1144,7 +1354,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             force_run=cli_force_override,
         )
         if not is_trading_day:
-            logging.getLogger("SwingQuantEngine.Orchestrator").info(
+            logger.info(
                 f"[Stage 2: PREFLIGHT_VERIFICATION] SKIPPED_MARKET_CLOSED "
                 f"(ny_date={eval_date.isoformat()}, reason={status_note}, is_trading_day=false)."
             )

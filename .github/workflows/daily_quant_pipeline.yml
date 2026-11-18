@@ -16,6 +16,16 @@ on:
         required: false
         type: string
         default: ''
+      reset_portfolio:
+        description: 'Operator Action: Reset portfolio to $100,000.00 baseline (0 holdings) and re-arm Kill-Switch (ARMED_READY)'
+        required: false
+        type: boolean
+        default: false
+      confirm_reset:
+        description: 'Confirmation Safeguard: Type RESET_PORTFOLIO_100K when reset_portfolio is enabled'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: swing-quant-eod-pipeline
@@ -78,7 +88,7 @@ jobs:
         run: |
           pytest -v --tb=short
 
-      - name: Gate 2 — Autonomous Daily EOD Execution & GCS Telemetry Export
+      - name: Gate 2 — Autonomous Daily EOD Execution, Baseline Reset & GCS Telemetry Export
         env:
           PYTHONPATH: .
           ENVIRONMENT: ${{ github.event.inputs.dry_run == 'true' && 'sandbox' || 'production' }}
@@ -90,10 +100,25 @@ jobs:
           GCS_BUCKET_NAME: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
           INTERNAL_SCHEDULER_TOKEN: ${{ secrets.INTERNAL_SCHEDULER_TOKEN }}
           SIRIX_CLOUD_RUN_URL: ${{ vars.SIRIX_CLOUD_RUN_URL || secrets.SIRIX_CLOUD_RUN_URL }}
+          RESET_PORTFOLIO: ${{ github.event.inputs.reset_portfolio == 'true' && 'true' || 'false' }}
+          CONFIRM_RESET: ${{ github.event.inputs.confirm_reset }}
         run: |
-          # Hydrate data/virtual_portfolio.json from GCS if absent locally (e.g., stateless runner)
-          python - <<'PY'
-          import json
+          if [ "${RESET_PORTFOLIO}" = "true" ]; then
+            if [ "${CONFIRM_RESET}" != "RESET_PORTFOLIO_100K" ]; then
+              echo "::error::Portfolio reset aborted: confirm_reset must be set to RESET_PORTFOLIO_100K"
+              exit 1
+            fi
+            ARGS=("--mode" "reset" "--confirm-reset" "${CONFIRM_RESET}")
+            if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+              ARGS+=("--dry-run")
+            fi
+            if [ -n "${{ github.event.inputs.target_date }}" ]; then
+              ARGS+=("--date" "${{ github.event.inputs.target_date }}")
+            fi
+            python -m src.main "${ARGS[@]}"
+          else
+            # Hydrate data/virtual_portfolio.json from GCS if absent locally (e.g., stateless runner)
+            python - <<'PY'
           import logging
           import os
           from pathlib import Path
@@ -116,14 +141,15 @@ jobs:
                   logger.info("No prior GCS state found (clean Day-1 initialization): %s", exc)
           PY
 
-          ARGS=("--mode" "daily")
-          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            ARGS+=("--dry-run")
+            ARGS=("--mode" "daily")
+            if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+              ARGS+=("--dry-run")
+            fi
+            if [ -n "${{ github.event.inputs.target_date }}" ]; then
+              ARGS+=("--date" "${{ github.event.inputs.target_date }}")
+            fi
+            python -m src.main "${ARGS[@]}"
           fi
-          if [ -n "${{ github.event.inputs.target_date }}" ]; then
-            ARGS+=("--date" "${{ github.event.inputs.target_date }}")
-          fi
-          python -m src.main "${ARGS[@]}"
 
           # Synchronize canonical F01 state artifacts (state/virtual_portfolio.json & state/eod_telemetry.json) to GCS
           if [ "${{ github.event.inputs.dry_run }}" != "true" ]; then
@@ -180,7 +206,11 @@ jobs:
             if [ -z "$COMMIT_DATE" ]; then
               COMMIT_DATE="$(date -u +'%Y-%m-%d')"
             fi
-            git commit -m "chore(ledger): atomic EOD virtual portfolio update (${COMMIT_DATE}) [skip ci]"
+            if [ "${{ github.event.inputs.reset_portfolio }}" = "true" ]; then
+              git commit -m "chore(ledger): operator portfolio baseline reset to $100,000.00 & kill-switch re-armed (${COMMIT_DATE}) [skip ci]"
+            else
+              git commit -m "chore(ledger): atomic EOD virtual portfolio update (${COMMIT_DATE}) [skip ci]"
+            fi
             git pull --rebase origin "${GITHUB_REF_NAME}"
             git push origin HEAD:"${GITHUB_REF_NAME}"
           fi
