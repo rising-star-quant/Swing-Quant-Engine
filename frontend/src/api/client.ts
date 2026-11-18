@@ -3,17 +3,26 @@ import {
   AuditLogResponse,
   AuthTokenResponse,
   ClosedTradeRecord,
+  DailyCandleBar,
+  ExitReasonCode,
+  GateCheckResult,
   HoldingSummaryCard,
   PortfolioOverviewResponse,
   PositionDeepDiveResponse,
+  RejectionStageCode,
+  SupportedLanguage,
+  SupportedTheme,
   TickerSearchResult,
+  TimeBarrierUrgency,
+  UniverseCode,
   UserPreferencesResponse,
   UserPreferencesUpdateRequest,
 } from '../types/sirix';
 
-const API_BASE_URL = (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_BASE_URL || '';
+const API_BASE_URL =
+  (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_BASE_URL || '';
 
-const CACHE_PREFIX = 'sirix_eod_cache_v1_';
+const CACHE_PREFIX = 'sirix_eod_cache_v2_';
 
 /* ==========================================================================
    Deterministic Institutional Sandbox Telemetry (RUT & MID Universes)
@@ -108,7 +117,10 @@ const SANDBOX_HOLDINGS_FULL: HoldingSummaryCard[] = [
   },
 ];
 
-const SANDBOX_DEEP_DIVES: Record<string, Omit<PositionDeepDiveResponse, 'account_tier' | 'is_tier_restricted'>> = {
+const SANDBOX_DEEP_DIVES: Record<
+  string,
+  Omit<PositionDeepDiveResponse, 'account_tier' | 'is_tier_restricted'>
+> = {
   CELH: {
     ticker: 'CELH',
     company_name: 'Celsius Holdings Inc.',
@@ -618,6 +630,7 @@ function loadSnapshotCache<T>(key: string): T | null {
 
 export class SirixApiClient {
   private accessToken: string | null = null;
+  private userId = 'usr_sirix_primary';
   private accountTier: AccountTier = 'PRO';
   private simulateDefensiveCash = false;
   private isUsingFallback = false;
@@ -625,6 +638,11 @@ export class SirixApiClient {
   public setSession(token: string | null, tier: AccountTier): void {
     this.accessToken = token;
     this.accountTier = tier;
+    if (token && token.startsWith('sirix_sandbox_')) {
+      this.isUsingFallback = true;
+    } else if (!token) {
+      this.isUsingFallback = false;
+    }
   }
 
   public setTier(tier: AccountTier): void {
@@ -644,12 +662,61 @@ export class SirixApiClient {
   }
 
   public isOfflineOrSandbox(): boolean {
-    return this.isUsingFallback || !API_BASE_URL;
+    return this.isUsingFallback;
+  }
+
+  private normalizeAuthPayload(raw: Record<string, unknown>, fallbackTier: AccountTier): AuthTokenResponse {
+    const nestedUser = (raw.user as Record<string, unknown> | undefined) || {};
+    const tier = ((nestedUser.account_tier || raw.account_tier || fallbackTier) as AccountTier) || 'PRO';
+    const uid = String(nestedUser.user_id || raw.user_id || 'usr_sirix_primary');
+    const expires = Number(raw.expires_in_seconds ?? raw.expires_in ?? 900);
+    const token = String(raw.access_token || '');
+
+    this.accessToken = token;
+    this.userId = uid;
+    this.accountTier = tier;
+
+    return {
+      access_token: token,
+      token_type: String(raw.token_type || 'bearer'),
+      expires_in_seconds: expires,
+      user_id: uid,
+      account_tier: tier,
+    };
+  }
+
+  private normalizePreferencesPayload(raw: Record<string, unknown>): UserPreferencesResponse {
+    const uiObj = (raw.ui as Record<string, unknown> | undefined) || {};
+    const guardrailsObj = (raw.guardrails as Record<string, unknown> | undefined) || {};
+
+    const language = ((raw.language || uiObj.language || 'en') as SupportedLanguage) || 'en';
+    const theme = ((raw.theme || uiObj.theme || 'obsidian-dark') as SupportedTheme) || 'obsidian-dark';
+    const tier = ((raw.account_tier || this.accountTier) as AccountTier) || this.accountTier;
+
+    return {
+      user_id: String(raw.user_id || this.userId || 'usr_sirix_primary'),
+      account_tier: tier,
+      language,
+      theme,
+      notifications_enabled: Boolean(raw.notifications_enabled ?? true),
+      guardrails_editable: tier === 'EXPERT',
+      guardrails: {
+        max_portfolio_heat_pct: Number(guardrailsObj.max_portfolio_heat_pct ?? 6.0),
+        risk_per_trade_pct: Number(guardrailsObj.risk_per_trade_pct ?? 1.0),
+        time_barrier_days: Number(guardrailsObj.time_barrier_days ?? 14),
+        earnings_blackout_days: Number(guardrailsObj.earnings_blackout_days ?? 5),
+        active_universes: (Array.isArray(guardrailsObj.active_universes)
+          ? guardrailsObj.active_universes
+          : ['RUT', 'MID']) as UniverseCode[],
+        zero_override_enforced: true,
+        kill_switch_active: Boolean(guardrailsObj.kill_switch_active ?? false),
+      },
+    };
   }
 
   private async requestWithAuth<T>(path: string, options: RequestInit = {}): Promise<T> {
-    if (!API_BASE_URL) {
-      throw new Error('SANDBOX_FALLBACK');
+    if (this.accessToken && this.accessToken.startsWith('sirix_sandbox_')) {
+      throw new Error('SANDBOX_SESSION');
     }
 
     const headers = new Headers(options.headers || {});
@@ -664,16 +731,19 @@ export class SirixApiClient {
       credentials: 'include',
     });
 
-    // Silent token refresh on 401
-    if (response.status === 401 && path !== '/api/v1/auth/login' && path !== '/api/v1/auth/refresh') {
+    // Silent token refresh on 401 via HttpOnly refresh cookie
+    if (
+      response.status === 401 &&
+      path !== '/api/v1/auth/login' &&
+      path !== '/api/v1/auth/refresh'
+    ) {
       const refreshRes = await fetch(`${API_BASE_URL}/api/v1/auth/refresh`, {
         method: 'POST',
         credentials: 'include',
       });
       if (refreshRes.ok) {
-        const tokenData = (await refreshRes.json()) as AuthTokenResponse;
-        this.accessToken = tokenData.access_token;
-        this.accountTier = tokenData.account_tier;
+        const rawRefresh = (await refreshRes.json()) as Record<string, unknown>;
+        this.normalizeAuthPayload(rawRefresh, this.accountTier);
         headers.set('Authorization', `Bearer ${this.accessToken}`);
         response = await fetch(`${API_BASE_URL}${path}`, {
           ...options,
@@ -694,27 +764,29 @@ export class SirixApiClient {
   /* ------------------------------------------------------------------------
      1. Authentication (/api/v1/auth/login)
      ------------------------------------------------------------------------ */
-  public async login(email: string, password: string, preferredTier: AccountTier = 'PRO'): Promise<AuthTokenResponse> {
+  public async login(
+    email: string,
+    password: string,
+    preferredTier: AccountTier = 'PRO'
+  ): Promise<AuthTokenResponse> {
     try {
-      const data = await this.requestWithAuth<AuthTokenResponse>('/api/v1/auth/login', {
+      const raw = await this.requestWithAuth<Record<string, unknown>>('/api/v1/auth/login', {
         method: 'POST',
         body: JSON.stringify({ email, password }),
       });
-      this.accessToken = data.access_token;
-      this.accountTier = data.account_tier;
-      return data;
+      return this.normalizeAuthPayload(raw, preferredTier);
     } catch {
       this.isUsingFallback = true;
       const resolvedTier: AccountTier = email.toLowerCase().includes('free')
         ? 'FREE'
-        : email.toLowerCase().includes('expert')
+        : email.toLowerCase().includes('expert') || email.toLowerCase().includes('trader')
         ? 'EXPERT'
         : preferredTier;
       const sandboxAuth: AuthTokenResponse = {
         access_token: `sirix_sandbox_jwt_${Date.now()}`,
         token_type: 'bearer',
         expires_in_seconds: 900,
-        user_id: 'usr_sirix_institutional_01',
+        user_id: 'usr_sirix_primary',
         account_tier: resolvedTier,
       };
       this.accessToken = sandboxAuth.access_token;
@@ -729,27 +801,112 @@ export class SirixApiClient {
   public async getPortfolioOverview(killSwitchActive = false): Promise<PortfolioOverviewResponse> {
     const cacheKey = `overview_${this.accountTier}_${this.simulateDefensiveCash}_${killSwitchActive}`;
     try {
-      const live = await this.requestWithAuth<PortfolioOverviewResponse>('/api/v1/portfolio/overview');
-      saveSnapshotCache(cacheKey, live);
-      return live;
+      const raw = await this.requestWithAuth<Record<string, unknown>>('/api/v1/portfolio/overview');
+
+      // Normalize canonical F01 backend payload (summary, holdings, defensive_cash_mode)
+      if (raw.summary && typeof raw.summary === 'object') {
+        const summary = raw.summary as Record<string, unknown>;
+        const totalEquity = Number(summary.total_equity ?? 100000);
+        const rawHoldings = Array.isArray(raw.holdings)
+          ? (raw.holdings as Record<string, unknown>[])
+          : [];
+
+        const mappedHoldings: HoldingSummaryCard[] = rawHoldings.map((h) => {
+          const posVal = Number(h.position_value ?? h.market_value ?? 0);
+          const pnlPct = Number(h.unrealized_pnl_pct ?? 0);
+          const daysHeld = Number(h.days_held ?? 1);
+          const maxDays = Number(h.max_days ?? h.max_hold_days ?? 14);
+          const weightPct = totalEquity > 0 ? Number(((posVal / totalEquity) * 100).toFixed(2)) : 0;
+          const urgency = ((h.timeline_phase || h.time_barrier_urgency || 'FRESH') as TimeBarrierUrgency);
+
+          return {
+            ticker: String(h.ticker || ''),
+            company_name: String(h.company_name || `${h.ticker} Corp.`),
+            universe: ((h.universe as UniverseCode) || 'RUT'),
+            shares: Number(h.shares ?? (Number(h.current_price) > 0 ? Math.round(posVal / Number(h.current_price)) : 0)),
+            entry_price: Number(h.entry_price ?? Number(h.current_price ?? 0)),
+            current_price: Number(h.current_price ?? 0),
+            position_value: posVal,
+            unrealized_pnl: Number(h.unrealized_pnl_amount ?? h.unrealized_pnl ?? ((posVal * pnlPct) / (100 + pnlPct || 100))),
+            unrealized_pnl_pct: pnlPct,
+            weight_pct: weightPct,
+            days_held: daysHeld,
+            max_hold_days: maxDays,
+            time_barrier_urgency: urgency,
+            conviction_score: this.accountTier === 'FREE' ? null : Number(h.conviction_score ?? 88.0),
+            stop_distance_atr: this.accountTier === 'FREE' ? null : Number(h.stop_distance_atr ?? 2.0),
+          };
+        });
+
+        const truncatedCount = Number(raw.truncated_count ?? 0);
+        const isDefensive =
+          Boolean(raw.defensive_cash_mode) ||
+          mappedHoldings.length === 0 ||
+          this.simulateDefensiveCash ||
+          killSwitchActive;
+
+        const normalized: PortfolioOverviewResponse = {
+          as_of_timestamp: String(raw.as_of_eod || raw.as_of_timestamp || new Date().toISOString()),
+          account_tier: this.accountTier,
+          system_state: killSwitchActive
+            ? 'HALTED_KILL_SWITCH'
+            : isDefensive
+            ? 'DEFENSIVE_CASH'
+            : 'NORMAL',
+          total_equity: totalEquity,
+          cash_balance: Number(summary.cash_balance ?? 100000),
+          invested_capital: Number(summary.invested_value ?? 0),
+          daily_change_usd: Number(summary.daily_change_amount ?? 0),
+          daily_change_pct: Number(summary.daily_change_pct ?? 0),
+          inception_return_usd: Number(summary.inception_change_amount ?? 0),
+          inception_return_pct: Number(summary.inception_change_pct ?? 0),
+          portfolio_heat_pct: Number(summary.portfolio_heat_pct ?? 0),
+          max_portfolio_heat_pct: Number(summary.max_portfolio_heat_pct ?? 6.0),
+          active_positions_count: mappedHoldings.length + truncatedCount,
+          visible_positions_count: mappedHoldings.length,
+          is_truncated_for_tier: truncatedCount > 0,
+          defensive_mode_context: isDefensive
+            ? {
+                is_active: true,
+                reason_code: killSwitchActive ? 'KILL_SWITCH_ACTIVE' : 'UNIVERSE_CHOPPINESS_HIGH',
+                title: killSwitchActive
+                  ? 'Emergency Kill-Switch Engaged — 100% Capital in Cash'
+                  : 'Autonomous Capital Preservation Active — 100% Cash Allocation',
+                explanation: killSwitchActive
+                  ? 'All autonomous entries are halted and 100% of portfolio equity is held in cash per your Emergency Kill-Switch directive.'
+                  : 'SIRIX currently holds 100% of portfolio equity in cash awaiting verified EOD breakout signals across Russell 2000 (RUT) and S&P MidCap 400 (MID).',
+                candidates_evaluated: 2400,
+                capital_preserved_pct: 100.0,
+              }
+            : null,
+          holdings: this.simulateDefensiveCash || killSwitchActive ? [] : mappedHoldings,
+        };
+
+        saveSnapshotCache(cacheKey, normalized);
+        return normalized;
+      }
+
+      const typedLive = raw as unknown as PortfolioOverviewResponse;
+      saveSnapshotCache(cacheKey, typedLive);
+      return typedLive;
     } catch {
       this.isUsingFallback = true;
       const tier = this.accountTier;
 
       if (this.simulateDefensiveCash || killSwitchActive) {
         const defensivePayload: PortfolioOverviewResponse = {
-          as_of_timestamp: '2025-05-12T21:30:00Z',
+          as_of_timestamp: '2026-11-17T21:00:00Z',
           account_tier: tier,
           system_state: killSwitchActive ? 'HALTED_KILL_SWITCH' : 'DEFENSIVE_CASH',
-          total_equity: 108450.25,
-          cash_balance: 108450.25,
+          total_equity: 100000.0,
+          cash_balance: 100000.0,
           invested_capital: 0,
           daily_change_usd: 0,
           daily_change_pct: 0,
-          inception_return_usd: 8450.25,
-          inception_return_pct: 8.45,
+          inception_return_usd: 0,
+          inception_return_pct: 0,
           portfolio_heat_pct: 0.0,
-          max_portfolio_heat_pct: 5.0,
+          max_portfolio_heat_pct: 6.0,
           active_positions_count: 0,
           visible_positions_count: 0,
           is_truncated_for_tier: false,
@@ -772,7 +929,9 @@ export class SirixApiClient {
       }
 
       const isFree = tier === 'FREE';
-      const visibleHoldings = (isFree ? SANDBOX_HOLDINGS_FULL.slice(0, 2) : SANDBOX_HOLDINGS_FULL).map((h) => ({
+      const visibleHoldings = (
+        isFree ? SANDBOX_HOLDINGS_FULL.slice(0, 2) : SANDBOX_HOLDINGS_FULL
+      ).map((h) => ({
         ...h,
         conviction_score: isFree ? null : h.conviction_score,
         stop_distance_atr: isFree ? null : h.stop_distance_atr,
@@ -804,17 +963,97 @@ export class SirixApiClient {
   }
 
   /* ------------------------------------------------------------------------
-     3. Position Deep-Dive Inspector (GET /api/v1/portfolio/positions/{ticker})
+     3. Position Deep-Dive Inspector (GET /api/v1/positions/{ticker})
      ------------------------------------------------------------------------ */
   public async getPositionDeepDive(ticker: string): Promise<PositionDeepDiveResponse> {
     const cleanTicker = ticker.trim().toUpperCase();
     const cacheKey = `deep_dive_${cleanTicker}_${this.accountTier}`;
     try {
-      const live = await this.requestWithAuth<PositionDeepDiveResponse>(
-        `/api/v1/portfolio/positions/${encodeURIComponent(cleanTicker)}`
+      const raw = await this.requestWithAuth<Record<string, unknown>>(
+        `/api/v1/positions/${encodeURIComponent(cleanTicker)}`
       );
-      saveSnapshotCache(cacheKey, live);
-      return live;
+
+      if (raw.barriers && typeof raw.barriers === 'object') {
+        const barriers = raw.barriers as Record<string, unknown>;
+        const qm = (raw.quant_metrics as Record<string, unknown> | undefined) || {};
+        const ohlc = Array.isArray(raw.ohlc_7d) ? (raw.ohlc_7d as Record<string, unknown>[]) : [];
+
+        const entryPrice = Number(raw.entry_price ?? 0);
+        const currentPrice = Number(raw.current_price ?? 0);
+        const tpPrice = barriers.take_profit != null ? Number(barriers.take_profit) : null;
+        const slPrice = barriers.chandelier_stop != null ? Number(barriers.chandelier_stop) : null;
+        const daysHeld = Number(barriers.days_held ?? 1);
+        const maxDays = Number(barriers.max_days ?? 14);
+        const ratio = maxDays > 0 ? daysHeld / maxDays : 0;
+        const urgency: TimeBarrierUrgency =
+          ratio <= 0.5 ? 'FRESH' : ratio <= 0.8 ? 'MATURING' : 'CRITICAL';
+        const isFree = this.accountTier === 'FREE';
+        const rawConv = qm.conviction_score != null ? Number(qm.conviction_score) : null;
+        const convPct =
+          rawConv != null ? (rawConv <= 1.0 ? Number((rawConv * 100).toFixed(1)) : rawConv) : null;
+
+        const mappedCandles: DailyCandleBar[] = ohlc.map((bar) => ({
+          date: String(bar.date || ''),
+          open: Number(bar.open ?? 0),
+          high: Number(bar.high ?? 0),
+          low: Number(bar.low ?? 0),
+          close: Number(bar.close ?? 0),
+          volume: Number(bar.volume ?? 1000000),
+        }));
+
+        const normalized: PositionDeepDiveResponse = {
+          ticker: String(raw.ticker || cleanTicker),
+          company_name: String(raw.company_name || `${cleanTicker} Corp.`),
+          universe: ((raw.universe as UniverseCode) || 'RUT'),
+          sector: String(raw.sector || `${raw.universe || 'RUT'} Quantitative Momentum Basket`),
+          account_tier: this.accountTier,
+          is_tier_restricted: isFree,
+          entry_date: String(raw.entry_date || ''),
+          days_held: daysHeld,
+          max_hold_days: maxDays,
+          days_remaining: Math.max(0, maxDays - daysHeld),
+          time_barrier_urgency: urgency,
+          shares: Number(raw.shares ?? 0),
+          position_value: Number(raw.position_value ?? 0),
+          unrealized_pnl: Number(raw.unrealized_pnl_amount ?? 0),
+          unrealized_pnl_pct: Number(raw.unrealized_pnl_pct ?? 0),
+          r_multiple_current: isFree ? null : 1.25,
+          conviction_score: isFree ? null : convPct,
+          momentum_rank_pct: isFree ? null : 95.0,
+          next_earnings_date: qm.next_earnings_date ? String(qm.next_earnings_date) : null,
+          days_until_earnings: 45,
+          earnings_blackout_SAFE: !Boolean(qm.earnings_blackout_active),
+          triple_barrier: {
+            take_profit_price: isFree ? null : tpPrice,
+            take_profit_pct:
+              !isFree && tpPrice != null && currentPrice > 0
+                ? Number((((tpPrice - currentPrice) / currentPrice) * 100).toFixed(2))
+                : null,
+            entry_price: entryPrice,
+            current_price: currentPrice,
+            chandelier_stop_price: isFree ? null : slPrice,
+            chandelier_stop_pct:
+              !isFree && slPrice != null && currentPrice > 0
+                ? Number((((slPrice - currentPrice) / currentPrice) * 100).toFixed(2))
+                : null,
+            atr_14: !isFree && qm.atr_14 != null ? Number(qm.atr_14) : null,
+            stop_distance_atr:
+              !isFree && barriers.stop_distance_atr != null
+                ? Number(barriers.stop_distance_atr)
+                : null,
+          },
+          recent_candles: mappedCandles,
+          strategy_rationale:
+            'Autonomous Triple-Barrier position managed via EOD Chandelier trailing stop, profit target ceiling, and 14-trading-day time barrier.',
+        };
+
+        saveSnapshotCache(cacheKey, normalized);
+        return normalized;
+      }
+
+      const typedLive = raw as unknown as PositionDeepDiveResponse;
+      saveSnapshotCache(cacheKey, typedLive);
+      return typedLive;
     } catch {
       this.isUsingFallback = true;
       const base = SANDBOX_DEEP_DIVES[cleanTicker] || SANDBOX_DEEP_DIVES.CELH;
@@ -847,20 +1086,67 @@ export class SirixApiClient {
   }
 
   /* ------------------------------------------------------------------------
-     4. Algorithmic Universe Search (GET /api/v1/universe/search?q={ticker})
+     4. Algorithmic Universe Search (GET /api/v1/search/{ticker})
      ------------------------------------------------------------------------ */
   public async searchUniverseTicker(query: string): Promise<TickerSearchResult> {
     const clean = query.trim().toUpperCase() || 'DUOL';
     try {
-      return await this.requestWithAuth<TickerSearchResult>(
-        `/api/v1/universe/search?q=${encodeURIComponent(clean)}`
+      const raw = await this.requestWithAuth<Record<string, unknown>>(
+        `/api/v1/search/${encodeURIComponent(clean)}`
       );
+
+      if (raw.ticker && raw.status) {
+        const status = (raw.status as 'HELD' | 'REJECTED') || 'REJECTED';
+        const reasons = Array.isArray(raw.rejection_reasons)
+          ? (raw.rejection_reasons as Record<string, unknown>[])
+          : [];
+        const firstCode = reasons[0]?.code ? String(reasons[0].code) : '';
+        const stageMap: Record<string, RejectionStageCode> = {
+          LIQUIDITY_FLOOR: 'STAGE_1_LIQUIDITY',
+          EARNINGS_BLACKOUT: 'STAGE_2_EARNINGS_BLACKOUT',
+          VOLATILITY_CAP: 'STAGE_3_CHOPPINESS_FILTER',
+          MOMENTUM_THRESHOLD: 'STAGE_4_MOMENTUM_RANK',
+          SECTOR_HEAT_LIMIT: 'PORTFOLIO_HEAT_CAP',
+        };
+        const gateChecks: GateCheckResult[] = reasons.map((r, idx) => ({
+          stage: `Gate ${idx + 1} • ${String(r.title || r.code || 'Filter')}`,
+          passed: false,
+          metric_label: String(r.code || 'Rejection Rule'),
+          metric_value: String(r.title || 'Blocked'),
+          threshold_required: String(r.explanation || ''),
+        }));
+
+        return {
+          query_ticker: String(raw.ticker),
+          company_name: String(raw.company_name || `${clean} Corp.`),
+          universe: ((raw.universe as UniverseCode) || 'RUT'),
+          as_of_date: String(raw.last_scan_eod || '2026-11-17').slice(0, 10),
+          account_tier: this.accountTier,
+          status,
+          rejection_stage:
+            status === 'HELD' ? null : stageMap[firstCode] || 'STAGE_4_MOMENTUM_RANK',
+          headline_verdict:
+            status === 'HELD'
+              ? 'Active Holding — Passed All Quantitative Screening Gates'
+              : String(reasons[0]?.title || 'Blocked by Quantitative Screening Gate'),
+          plain_English_explanation:
+            status === 'HELD'
+              ? `${raw.ticker} is currently an active holding in the autonomous portfolio.`
+              : String(
+                  reasons[0]?.explanation ||
+                    'Candidate did not satisfy all quantitative screening thresholds during the latest EOD scan.'
+                ),
+          conviction_score: this.accountTier === 'FREE' ? null : status === 'HELD' ? 91.0 : 64.0,
+          gate_checks: this.accountTier === 'FREE' ? [] : gateChecks,
+        };
+      }
+
+      return raw as unknown as TickerSearchResult;
     } catch {
       this.isUsingFallback = true;
       const tier = this.accountTier;
       const isFree = tier === 'FREE';
 
-      // Check if held in portfolio
       const heldMatch = SANDBOX_HOLDINGS_FULL.find((h) => h.ticker === clean);
       if (heldMatch) {
         return {
@@ -909,7 +1195,6 @@ export class SirixApiClient {
         };
       }
 
-      // Check predefined rejected tickers
       const predefined = SANDBOX_REJECTED_TICKERS[clean];
       if (predefined) {
         return {
@@ -920,12 +1205,11 @@ export class SirixApiClient {
         };
       }
 
-      // Deterministic synthesized rejection for any other ticker symbol
       const charCodeSum = clean.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
       const isStage1 = charCodeSum % 2 === 0;
       const universe = charCodeSum % 3 === 0 ? 'MID' : 'RUT';
 
-      const synthesized: TickerSearchResult = {
+      return {
         query_ticker: clean,
         company_name: `${clean} Corp. (${universe} Constituent)`,
         universe,
@@ -973,20 +1257,77 @@ export class SirixApiClient {
               },
             ],
       };
-
-      return synthesized;
     }
   }
 
   /* ------------------------------------------------------------------------
-     5. Closed Trades Audit Log (GET /api/v1/audit/closed-trades)
+     5. Closed Trades Audit Log (GET /api/v1/audit-log)
      ------------------------------------------------------------------------ */
   public async getAuditLog(): Promise<AuditLogResponse> {
     const cacheKey = `audit_${this.accountTier}`;
     try {
-      const live = await this.requestWithAuth<AuditLogResponse>('/api/v1/audit/closed-trades');
-      saveSnapshotCache(cacheKey, live);
-      return live;
+      const raw = await this.requestWithAuth<Record<string, unknown>>('/api/v1/audit-log');
+
+      if (Array.isArray(raw.items)) {
+        const rawItems = raw.items as Record<string, unknown>[];
+        const totalCount = Number(raw.total_count ?? rawItems.length);
+        const exitMap: Record<string, ExitReasonCode> = {
+          TAKE_PROFIT: 'TAKE_PROFIT_HIT',
+          CHANDELIER_STOP: 'CHANDELIER_STOP_HIT',
+          TIME_BARRIER: 'TIME_BARRIER_EXPIRED',
+          EARNINGS_BLACKOUT: 'EARNINGS_BLACKOUT_EXIT',
+          KILL_SWITCH: 'KILL_SWITCH_LIQUIDATION',
+        };
+
+        const trades: ClosedTradeRecord[] = rawItems.map((item) => {
+          const reasonKey = String(item.exit_reason || 'TAKE_PROFIT');
+          const mappedReason = exitMap[reasonKey] || (reasonKey as ExitReasonCode) || 'TAKE_PROFIT_HIT';
+          const pnlPct = Number(item.realized_pnl_pct ?? 0);
+          return {
+            trade_id: String(item.trade_id || ''),
+            ticker: String(item.ticker || ''),
+            company_name: String(item.company_name || `${item.ticker} Corp.`),
+            universe: ((item.universe as UniverseCode) || 'RUT'),
+            entry_date: String(item.entry_date || ''),
+            exit_date: String(item.exit_date || ''),
+            days_held: Number(item.days_held ?? 1),
+            shares: Number(item.shares ?? 100),
+            entry_price: Number(item.entry_price ?? 0),
+            exit_price: Number(item.exit_price ?? 0),
+            realized_pnl: Number(item.realized_pnl_amount ?? item.realized_pnl ?? 0),
+            realized_pnl_pct: pnlPct,
+            r_multiple: Number((pnlPct / 5.0).toFixed(2)),
+            exit_reason: mappedReason,
+            exit_reason_label: `${reasonKey.replace(/_/g, ' ')} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)`,
+          };
+        });
+
+        const winners = trades.filter((t) => t.realized_pnl > 0).length;
+        const winRate = trades.length > 0 ? Number(((winners / trades.length) * 100).toFixed(1)) : 0;
+        const totalPnl = trades.reduce((acc, t) => acc + t.realized_pnl, 0);
+        const avgR =
+          trades.length > 0
+            ? Number((trades.reduce((acc, t) => acc + t.r_multiple, 0) / trades.length).toFixed(2))
+            : 0;
+
+        const normalized: AuditLogResponse = {
+          account_tier: this.accountTier,
+          total_closed_trades: totalCount,
+          win_rate_pct: winRate,
+          avg_r_multiple: avgR,
+          cumulative_realized_pnl: Number(totalPnl.toFixed(2)),
+          is_truncated_for_tier: this.accountTier === 'FREE' && totalCount > trades.length,
+          csv_export_allowed: this.accountTier === 'EXPERT',
+          trades,
+        };
+
+        saveSnapshotCache(cacheKey, normalized);
+        return normalized;
+      }
+
+      const typedLive = raw as unknown as AuditLogResponse;
+      saveSnapshotCache(cacheKey, typedLive);
+      return typedLive;
     } catch {
       this.isUsingFallback = true;
       const tier = this.accountTier;
@@ -1014,30 +1355,29 @@ export class SirixApiClient {
   public async getPreferences(): Promise<UserPreferencesResponse> {
     const cached = loadSnapshotCache<UserPreferencesResponse>('user_prefs');
     try {
-      const live = await this.requestWithAuth<UserPreferencesResponse>('/api/v1/preferences');
-      saveSnapshotCache('user_prefs', live);
-      return live;
+      const raw = await this.requestWithAuth<Record<string, unknown>>('/api/v1/preferences');
+      const normalized = this.normalizePreferencesPayload(raw);
+      saveSnapshotCache('user_prefs', normalized);
+      return normalized;
     } catch {
-      this.isUsingFallback = true;
-      const fallback: UserPreferencesResponse = cached || {
-        user_id: 'usr_sirix_institutional_01',
+      const fallback: UserPreferencesResponse = {
+        user_id: this.userId,
         account_tier: this.accountTier,
-        language: 'en',
-        theme: 'obsidian-dark',
-        notifications_enabled: true,
+        language: cached?.language || 'en',
+        theme: cached?.theme || 'obsidian-dark',
+        notifications_enabled: cached?.notifications_enabled ?? true,
         guardrails_editable: this.accountTier === 'EXPERT',
         guardrails: {
-          max_portfolio_heat_pct: 5.0,
-          risk_per_trade_pct: 1.0,
-          time_barrier_days: 14,
-          earnings_blackout_days: 5,
-          active_universes: ['RUT', 'MID'],
+          max_portfolio_heat_pct: cached?.guardrails?.max_portfolio_heat_pct ?? 6.0,
+          risk_per_trade_pct: cached?.guardrails?.risk_per_trade_pct ?? 1.0,
+          time_barrier_days: cached?.guardrails?.time_barrier_days ?? 14,
+          earnings_blackout_days: cached?.guardrails?.earnings_blackout_days ?? 5,
+          active_universes: cached?.guardrails?.active_universes ?? ['RUT', 'MID'],
           zero_override_enforced: true,
-          kill_switch_active: false,
+          // Never sticky-cache a halted kill-switch across unauthenticated sessions
+          kill_switch_active: this.accessToken ? Boolean(cached?.guardrails?.kill_switch_active) : false,
         },
       };
-      fallback.account_tier = this.accountTier;
-      fallback.guardrails_editable = this.accountTier === 'EXPERT';
       return fallback;
     }
   }
@@ -1047,12 +1387,43 @@ export class SirixApiClient {
     patch: UserPreferencesUpdateRequest
   ): Promise<UserPreferencesResponse> {
     try {
-      const live = await this.requestWithAuth<UserPreferencesResponse>('/api/v1/preferences', {
+      const backendPatchBody: Record<string, unknown> = {};
+      if (patch.language !== undefined || patch.theme !== undefined) {
+        backendPatchBody.ui = {
+          ...(patch.language !== undefined ? { language: patch.language } : {}),
+          ...(patch.theme !== undefined ? { theme: patch.theme } : {}),
+        };
+      }
+      if (patch.guardrails !== undefined) {
+        backendPatchBody.guardrails = {
+          ...(patch.guardrails.max_portfolio_heat_pct !== undefined
+            ? { max_portfolio_heat_pct: patch.guardrails.max_portfolio_heat_pct }
+            : {}),
+          ...(patch.guardrails.risk_per_trade_pct !== undefined
+            ? { risk_per_trade_pct: patch.guardrails.risk_per_trade_pct }
+            : {}),
+          ...(patch.guardrails.time_barrier_days !== undefined
+            ? { time_barrier_days: patch.guardrails.time_barrier_days }
+            : {}),
+          ...(patch.guardrails.earnings_blackout_days !== undefined
+            ? { earnings_blackout_days: patch.guardrails.earnings_blackout_days }
+            : {}),
+          ...(patch.guardrails.zero_override_enforced !== undefined
+            ? { zero_override_enforced: patch.guardrails.zero_override_enforced }
+            : {}),
+          ...(patch.guardrails.kill_switch_active !== undefined
+            ? { kill_switch_active: patch.guardrails.kill_switch_active }
+            : {}),
+        };
+      }
+
+      const raw = await this.requestWithAuth<Record<string, unknown>>('/api/v1/preferences', {
         method: 'PATCH',
-        body: JSON.stringify(patch),
+        body: JSON.stringify(backendPatchBody),
       });
-      saveSnapshotCache('user_prefs', live);
-      return live;
+      const normalized = this.normalizePreferencesPayload(raw);
+      saveSnapshotCache('user_prefs', normalized);
+      return normalized;
     } catch {
       this.isUsingFallback = true;
       const updated: UserPreferencesResponse = {

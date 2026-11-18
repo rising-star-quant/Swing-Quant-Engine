@@ -19,9 +19,9 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { syncTierWithPreferences } = usePreferences();
+  const { syncTierWithPreferences, refreshPreferences } = usePreferences();
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(true);
-  const [userId, setUserId] = useState<string>('usr_sirix_institutional_01');
+  const [userId, setUserId] = useState<string>('usr_sirix_primary');
   const [accountTier, setAccountTier] = useState<AccountTier>('PRO');
   const [simulateDefensiveCash, setSimulateDefensiveCash] = useState<boolean>(false);
 
@@ -30,6 +30,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setUserId(authRes.user_id);
     setAccountTier(authRes.account_tier);
     syncTierWithPreferences(authRes.account_tier);
+    await refreshPreferences();
     setIsAuthenticated(true);
   };
 
@@ -37,6 +38,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     sirixClient.setSession(`sirix_sandbox_${Date.now()}`, tier);
     setAccountTier(tier);
     syncTierWithPreferences(tier);
+    void refreshPreferences();
     setIsAuthenticated(true);
   };
 

@@ -25,17 +25,18 @@ interface PreferencesContextValue {
   setTheme: (theme: SupportedTheme) => Promise<void>;
   updateGuardrails: (patch: Partial<RiskGuardrailConfig>) => Promise<void>;
   syncTierWithPreferences: (tier: AccountTier) => void;
+  refreshPreferences: () => Promise<UserPreferencesResponse>;
 }
 
 const DEFAULT_PREFERENCES: UserPreferencesResponse = {
-  user_id: 'usr_sirix_institutional_01',
+  user_id: 'usr_sirix_primary',
   account_tier: 'PRO',
   language: 'en',
   theme: 'obsidian-dark',
   notifications_enabled: true,
   guardrails_editable: false,
   guardrails: {
-    max_portfolio_heat_pct: 5.0,
+    max_portfolio_heat_pct: 6.0,
     risk_per_trade_pct: 1.0,
     time_barrier_days: 14,
     earnings_blackout_days: 5,
@@ -64,12 +65,16 @@ export const PreferencesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }
   }, []);
 
-  useEffect(() => {
-    sirixClient.getPreferences().then((loaded) => {
-      setPreferences(loaded);
-      applyDomAttributes(loaded.language, loaded.theme);
-    });
+  const refreshPreferences = useCallback(async (): Promise<UserPreferencesResponse> => {
+    const loaded = await sirixClient.getPreferences();
+    setPreferences(loaded);
+    applyDomAttributes(loaded.language, loaded.theme);
+    return loaded;
   }, [applyDomAttributes]);
+
+  useEffect(() => {
+    void refreshPreferences();
+  }, [refreshPreferences]);
 
   const setLanguage = async (language: SupportedLanguage) => {
     applyDomAttributes(language, preferences.theme);
@@ -113,6 +118,7 @@ export const PreferencesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         setTheme,
         updateGuardrails,
         syncTierWithPreferences,
+        refreshPreferences,
       }}
     >
       {children}
