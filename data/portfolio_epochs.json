@@ -1,0 +1,29 @@
+{
+  "active_epoch_id": 2,
+  "active_epoch_alias": "New Start",
+  "state_revision_id": "epoch_2_20261119T202914Z",
+  "epochs": [
+    {
+      "epoch_id": 1,
+      "epoch_alias": "Genesis Epoch",
+      "reset_timestamp_utc": "2026-11-19T20:29:14.569739Z",
+      "closing_equity_before_reset": 100000.0,
+      "starting_equity": 100000.0,
+      "positions_liquidated_count": 0,
+      "triggered_by": "GENESIS",
+      "closed_at_utc": "2026-11-19T20:29:14.569551Z",
+      "epoch_return_pct": 0.0
+    },
+    {
+      "epoch_id": 2,
+      "epoch_alias": "New Start",
+      "reset_timestamp_utc": "2026-11-19T20:29:14.569551Z",
+      "closing_equity_before_reset": 100000.0,
+      "starting_equity": 100000.0,
+      "positions_liquidated_count": 0,
+      "triggered_by": "GITHUB_ACTIONS_MANUAL",
+      "closed_at_utc": null,
+      "epoch_return_pct": 0.0
+    }
+  ]
+}

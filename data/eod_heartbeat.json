@@ -1,0 +1,10 @@
+{
+  "last_successful_eod_timestamp": "2026-11-19T20:29:14.621962Z",
+  "last_updated_utc": "2026-11-19T20:29:14.621962Z",
+  "eod_status": "IDLE",
+  "trading_date": "2026-11-19",
+  "current_portfolio_heat_pct": 0.0,
+  "portfolio_heat_pct": 0.0,
+  "open_positions_count": 0,
+  "total_equity": 100000.0
+}

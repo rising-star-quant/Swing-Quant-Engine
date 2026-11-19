@@ -1,0 +1,12 @@
+{
+  "state_revision_id": "epoch_2_20261119T202914Z",
+  "epoch_id": 2,
+  "epoch_alias": "New Start",
+  "last_updated_utc": "2026-11-19T20:29:14.569551Z",
+  "cash_balance": 100000.0,
+  "total_equity": 100000.0,
+  "portfolio_heat_pct": 0.0,
+  "open_positions_count": 0,
+  "kill_switch_status": "ARMED_READY",
+  "kill_switch_active": false
+}
