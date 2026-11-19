@@ -1,0 +1,129 @@
+name: SIRIX — Controlled Portfolio Epoch Reset (E.1)
+
+on:
+  workflow_dispatch:
+    inputs:
+      epoch_alias:
+        description: 'New Epoch Alias (min 3 chars, e.g. "ATR 2.5x Calibration" or "Post-Slippage Fix")'
+        required: true
+        type: string
+      confirm_reset:
+        description: 'Double-Confirmation Safeguard: Type RESET exactly to execute Hard Epoch Reset to $100,000.00'
+        required: true
+        type: string
+
+concurrency:
+  group: sirix-portfolio-epoch-reset
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  epoch-reset:
+    name: Atomic Hard Epoch Reset ($100k Baseline + 4-Layer Cache Invalidation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      EPOCH_ALIAS: ${{ github.event.inputs.epoch_alias }}
+      CONFIRM_RESET: ${{ github.event.inputs.confirm_reset }}
+
+    steps:
+      - name: Pre-Flight Double-Confirmation Guard (Fail Fast Before GCS Access)
+        run: |
+          if [ "${CONFIRM_RESET}" != "RESET" ]; then
+            echo "::error::Hard Epoch Reset aborted: confirm_reset MUST equal 'RESET' exactly (received '${CONFIRM_RESET}'). Zero changes made to GCS."
+            exit 1
+          fi
+          TRIMMED_ALIAS="$(printf '%s' "${EPOCH_ALIAS}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          if [ "${#TRIMMED_ALIAS}" -lt 3 ]; then
+            echo "::error::Hard Epoch Reset aborted: epoch_alias must be at least 3 characters long."
+            exit 1
+          fi
+          echo "Pre-flight confirmation verified. Proceeding to Hard Epoch Reset for alias: ${TRIMMED_ALIAS}"
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set Up Python 3.11 with Pip Cache
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          if [ -f "requirements-api.txt" ]; then
+            pip install -r requirements-api.txt
+          fi
+
+      - name: Authenticate to Google Cloud via Workload Identity Federation (OIDC)
+        if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.GCP_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Authenticate to Google Cloud via Service Account Key (Fallback)
+        if: ${{ (vars.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || vars.GCP_SERVICE_ACCOUNT == '') && env.GCP_SA_KEY != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Execute E.1 Atomic Portfolio Epoch Reset Transaction
+        env:
+          PYTHONPATH: .
+          ENVIRONMENT: production
+          SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
+          GCS_BUCKET_NAME: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SIRIX_CLOUD_RUN_URL: ${{ vars.SIRIX_CLOUD_RUN_URL || secrets.SIRIX_CLOUD_RUN_URL }}
+          INTERNAL_SCHEDULER_TOKEN: ${{ secrets.INTERNAL_SCHEDULER_TOKEN }}
+        run: |
+          python scripts/reset_portfolio.py \
+            --epoch-alias "${EPOCH_ALIAS}" \
+            --confirm-reset "${CONFIRM_RESET}" \
+            --triggered-by "GITHUB_ACTIONS_MANUAL"
+
+      - name: Commit Synchronized Epoch & State Artifacts to Git ([skip ci])
+        if: ${{ success() }}
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          for f in \
+            data/virtual_portfolio.json \
+            data/eod_heartbeat.json \
+            data/state.json \
+            data/portfolio_epochs.json \
+            data/equity_history.json \
+            data/trade_history.json \
+            data/state/virtual_portfolio.json \
+            data/state/state.json \
+            data/state/portfolio_epochs.json \
+            data/state/equity_history.json \
+            data/state/equity_curve.json \
+            data/state/trade_history.json \
+            data/state/eod_telemetry.json \
+            data/state/eod_heartbeat.json; do
+            if [ -f "$f" ]; then
+              git add "$f"
+            fi
+          done
+
+          if git diff --staged --quiet; then
+            echo "No local Git ledger diffs to commit (GCS remains Single Source of Truth)."
+          else
+            UTC_STAMP="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git commit -m "chore(epoch): hard portfolio epoch reset '${EPOCH_ALIAS}' to \$100,000.00 (${UTC_STAMP}) [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push origin HEAD:"${GITHUB_REF_NAME}"
+          fi

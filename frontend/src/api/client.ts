@@ -4,9 +4,14 @@ import {
   AuthTokenResponse,
   ClosedTradeRecord,
   DailyCandleBar,
+  EpochChangeEvent,
+  EquityHistoryPoint,
+  EquityHistoryResponse,
   ExitReasonCode,
   GateCheckResult,
   HoldingSummaryCard,
+  PortfolioEpochRecord,
+  PortfolioEpochsResponse,
   PortfolioOverviewResponse,
   PositionDeepDiveResponse,
   RejectionStageCode,
@@ -23,6 +28,52 @@ const API_BASE_URL =
   (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_BASE_URL || '';
 
 const CACHE_PREFIX = 'sirix_eod_cache_v2_';
+const EPOCH_ID_STORAGE_KEY = 'sirix_active_epoch_id';
+const EPOCH_ALIAS_STORAGE_KEY = 'sirix_active_epoch_alias';
+const STATE_REV_STORAGE_KEY = 'sirix_state_revision_id';
+
+const SANDBOX_EPOCHS: PortfolioEpochRecord[] = [
+  {
+    epoch_id: 1,
+    epoch_alias: 'Genesis Baseline',
+    reset_timestamp_utc: '2025-04-01T21:00:00Z',
+    closing_equity_before_reset: 112450.0,
+    starting_equity: 100000.0,
+    positions_liquidated_count: 3,
+    triggered_by: 'GENESIS',
+    closed_at_utc: '2025-05-01T21:00:00Z',
+    epoch_return_pct: 12.45,
+  },
+  {
+    epoch_id: 2,
+    epoch_alias: 'ATR 2.5x Calibration',
+    reset_timestamp_utc: '2025-05-01T21:00:00Z',
+    closing_equity_before_reset: 112450.0,
+    starting_equity: 100000.0,
+    positions_liquidated_count: 3,
+    triggered_by: 'GITHUB_ACTIONS_MANUAL',
+    closed_at_utc: null,
+    epoch_return_pct: 8.45,
+  },
+];
+
+const SANDBOX_EQUITY_HISTORY: EquityHistoryPoint[] = [
+  { date: '2025-04-02', raw_portfolio_value: 100000.0, cumulative_algo_return_pct: 0.0, epoch_id: 1, epoch_marker: null },
+  { date: '2025-04-08', raw_portfolio_value: 103200.0, cumulative_algo_return_pct: 3.2, epoch_id: 1, epoch_marker: null },
+  { date: '2025-04-15', raw_portfolio_value: 106800.0, cumulative_algo_return_pct: 6.8, epoch_id: 1, epoch_marker: null },
+  { date: '2025-04-22', raw_portfolio_value: 109600.0, cumulative_algo_return_pct: 9.6, epoch_id: 1, epoch_marker: null },
+  { date: '2025-04-30', raw_portfolio_value: 112450.0, cumulative_algo_return_pct: 12.45, epoch_id: 1, epoch_marker: null },
+  {
+    date: '2025-05-01',
+    raw_portfolio_value: 100000.0,
+    cumulative_algo_return_pct: 12.45,
+    epoch_id: 2,
+    epoch_marker: { epoch_id: 2, alias: 'ATR 2.5x Calibration' },
+  },
+  { date: '2025-05-05', raw_portfolio_value: 102850.0, cumulative_algo_return_pct: 15.65, epoch_id: 2, epoch_marker: null },
+  { date: '2025-05-08', raw_portfolio_value: 105420.0, cumulative_algo_return_pct: 18.54, epoch_id: 2, epoch_marker: null },
+  { date: '2025-05-12', raw_portfolio_value: 108450.25, cumulative_algo_return_pct: 21.95, epoch_id: 2, epoch_marker: null },
+];
 
 /* ==========================================================================
    Deterministic Institutional Sandbox Telemetry (RUT & MID Universes)
@@ -624,9 +675,26 @@ function loadSnapshotCache<T>(key: string): T | null {
   }
 }
 
+function clearAllSnapshotCaches(): void {
+  try {
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith('sirix_eod_cache_')) {
+        keysToRemove.push(key);
+      }
+    }
+    keysToRemove.forEach((k) => localStorage.removeItem(k));
+  } catch {
+    // Ignore storage access errors
+  }
+}
+
 /* ==========================================================================
    SIRIX Typed API Client Class
    ========================================================================== */
+
+type EpochChangeListener = (event: EpochChangeEvent) => void;
 
 export class SirixApiClient {
   private accessToken: string | null = null;
@@ -634,6 +702,79 @@ export class SirixApiClient {
   private accountTier: AccountTier = 'PRO';
   private simulateDefensiveCash = false;
   private isUsingFallback = false;
+  private epochListeners = new Set<EpochChangeListener>();
+
+  public subscribeEpochChange(listener: EpochChangeListener): () => void {
+    this.epochListeners.add(listener);
+    return () => {
+      this.epochListeners.delete(listener);
+    };
+  }
+
+  public clearLocalCache(): void {
+    clearAllSnapshotCaches();
+  }
+
+  public getStoredEpochMetadata(): {
+    epochId: number | null;
+    epochAlias: string | null;
+    stateRevisionId: string | null;
+  } {
+    try {
+      const rawId = localStorage.getItem(EPOCH_ID_STORAGE_KEY);
+      const rawAlias = localStorage.getItem(EPOCH_ALIAS_STORAGE_KEY);
+      const rawRev = localStorage.getItem(STATE_REV_STORAGE_KEY);
+      return {
+        epochId: rawId ? Number(rawId) : null,
+        epochAlias: rawAlias,
+        stateRevisionId: rawRev,
+      };
+    } catch {
+      return { epochId: null, epochAlias: null, stateRevisionId: null };
+    }
+  }
+
+  private evaluateEpochGuard(
+    serverEpochId: number | null,
+    serverStateRev: string | null,
+    serverEpochAlias?: string | null
+  ): void {
+    if (!serverEpochId && !serverStateRev) return;
+
+    const stored = this.getStoredEpochMetadata();
+    const resolvedEpochId = serverEpochId ?? stored.epochId ?? 1;
+    const resolvedStateRev = serverStateRev ?? stored.stateRevisionId ?? `epoch_${resolvedEpochId}`;
+    const resolvedAlias = serverEpochAlias || stored.epochAlias || `Epoch #${resolvedEpochId}`;
+
+    const epochChanged =
+      stored.epochId !== null && serverEpochId !== null && serverEpochId !== stored.epochId;
+    const revisionChanged =
+      stored.stateRevisionId !== null &&
+      serverStateRev !== null &&
+      serverStateRev !== stored.stateRevisionId;
+
+    try {
+      localStorage.setItem(EPOCH_ID_STORAGE_KEY, String(resolvedEpochId));
+      if (serverEpochAlias) {
+        localStorage.setItem(EPOCH_ALIAS_STORAGE_KEY, serverEpochAlias);
+      }
+      localStorage.setItem(STATE_REV_STORAGE_KEY, resolvedStateRev);
+    } catch {
+      // Ignore storage write errors
+    }
+
+    if (epochChanged || revisionChanged) {
+      clearAllSnapshotCaches();
+      const changeEvent: EpochChangeEvent = {
+        previousEpochId: stored.epochId,
+        newEpochId: resolvedEpochId,
+        newEpochAlias: resolvedAlias,
+        previousStateRev: stored.stateRevisionId,
+        newStateRev: resolvedStateRev,
+      };
+      this.epochListeners.forEach((cb) => cb(changeEvent));
+    }
+  }
 
   public setSession(token: string | null, tier: AccountTier): void {
     this.accessToken = token;
@@ -714,20 +855,35 @@ export class SirixApiClient {
     };
   }
 
-  private async requestWithAuth<T>(path: string, options: RequestInit = {}): Promise<T> {
+  private buildRequestUrl(path: string, forceBust = false): string {
+    if (!forceBust) return `${API_BASE_URL}${path}`;
+    const sep = path.includes('?') ? '&' : '?';
+    return `${API_BASE_URL}${path}${sep}t=${Date.now()}`;
+  }
+
+  private async requestWithAuth<T>(
+    path: string,
+    options: RequestInit = {},
+    forceBust = false
+  ): Promise<T> {
     if (this.accessToken && this.accessToken.startsWith('sirix_sandbox_')) {
       throw new Error('SANDBOX_SESSION');
     }
 
     const headers = new Headers(options.headers || {});
     headers.set('Content-Type', 'application/json');
+    if (forceBust) {
+      headers.set('Cache-Control', 'no-cache, no-store, max-age=0');
+    }
     if (this.accessToken) {
       headers.set('Authorization', `Bearer ${this.accessToken}`);
     }
 
-    let response = await fetch(`${API_BASE_URL}${path}`, {
+    const targetUrl = this.buildRequestUrl(path, forceBust);
+    let response = await fetch(targetUrl, {
       ...options,
       headers,
+      cache: 'no-store',
       credentials: 'include',
     });
 
@@ -739,15 +895,17 @@ export class SirixApiClient {
     ) {
       const refreshRes = await fetch(`${API_BASE_URL}/api/v1/auth/refresh`, {
         method: 'POST',
+        cache: 'no-store',
         credentials: 'include',
       });
       if (refreshRes.ok) {
         const rawRefresh = (await refreshRes.json()) as Record<string, unknown>;
         this.normalizeAuthPayload(rawRefresh, this.accountTier);
         headers.set('Authorization', `Bearer ${this.accessToken}`);
-        response = await fetch(`${API_BASE_URL}${path}`, {
+        response = await fetch(targetUrl, {
           ...options,
           headers,
+          cache: 'no-store',
           credentials: 'include',
         });
       }
@@ -757,8 +915,38 @@ export class SirixApiClient {
       throw new Error(`HTTP_${response.status}`);
     }
 
+    const headerEpochRaw = response.headers.get('X-SIRIX-Epoch-ID');
+    const headerStateRev = response.headers.get('X-SIRIX-State-Rev');
+    const parsedHeaderEpoch = headerEpochRaw ? Number(headerEpochRaw) : null;
+
     this.isUsingFallback = false;
-    return (await response.json()) as T;
+    const payload = (await response.json()) as T;
+
+    // Layer 4 Epoch-Change Guard: check headers + root JSON payload metadata
+    const payloadObj =
+      payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : null;
+    const payloadEpoch =
+      payloadObj && (payloadObj.epoch_id != null || payloadObj.active_epoch_id != null)
+        ? Number(payloadObj.epoch_id ?? payloadObj.active_epoch_id)
+        : null;
+    const payloadRev =
+      payloadObj && typeof payloadObj.state_revision_id === 'string'
+        ? payloadObj.state_revision_id
+        : null;
+    const payloadAlias =
+      payloadObj &&
+      (typeof payloadObj.epoch_alias === 'string' ||
+        typeof payloadObj.active_epoch_alias === 'string')
+        ? String(payloadObj.epoch_alias ?? payloadObj.active_epoch_alias)
+        : null;
+
+    this.evaluateEpochGuard(
+      Number.isFinite(parsedHeaderEpoch) ? parsedHeaderEpoch : payloadEpoch,
+      headerStateRev || payloadRev,
+      payloadAlias
+    );
+
+    return payload;
   }
 
   /* ------------------------------------------------------------------------
@@ -798,10 +986,17 @@ export class SirixApiClient {
   /* ------------------------------------------------------------------------
      2. Portfolio Overview (GET /api/v1/portfolio/overview)
      ------------------------------------------------------------------------ */
-  public async getPortfolioOverview(killSwitchActive = false): Promise<PortfolioOverviewResponse> {
+  public async getPortfolioOverview(
+    killSwitchActive = false,
+    forceBust = false
+  ): Promise<PortfolioOverviewResponse> {
     const cacheKey = `overview_${this.accountTier}_${this.simulateDefensiveCash}_${killSwitchActive}`;
     try {
-      const raw = await this.requestWithAuth<Record<string, unknown>>('/api/v1/portfolio/overview');
+      const raw = await this.requestWithAuth<Record<string, unknown>>(
+        '/api/v1/portfolio/overview',
+        {},
+        forceBust
+      );
 
       // Normalize canonical F01 backend payload (summary, holdings, defensive_cash_mode)
       if (raw.summary && typeof raw.summary === 'object') {
@@ -853,6 +1048,9 @@ export class SirixApiClient {
             : isDefensive
             ? 'DEFENSIVE_CASH'
             : 'NORMAL',
+          epoch_id: Number(raw.epoch_id ?? 1),
+          epoch_alias: String(raw.epoch_alias || 'Genesis Epoch'),
+          state_revision_id: String(raw.state_revision_id || 'epoch_1_genesis'),
           total_equity: totalEquity,
           cash_balance: Number(summary.cash_balance ?? 100000),
           invested_capital: Number(summary.invested_value ?? 0),
@@ -941,6 +1139,9 @@ export class SirixApiClient {
         as_of_timestamp: '2025-05-12T21:30:00Z',
         account_tier: tier,
         system_state: 'NORMAL',
+        epoch_id: 2,
+        epoch_alias: 'ATR 2.5x Calibration',
+        state_revision_id: 'epoch_2_20250512T213000Z',
         total_equity: 108450.25,
         cash_balance: 10764.00,
         invested_capital: 97686.25,
@@ -959,6 +1160,45 @@ export class SirixApiClient {
 
       saveSnapshotCache(cacheKey, overview);
       return overview;
+    }
+  }
+
+  /* ------------------------------------------------------------------------
+     2A. E.1 Portfolio Epochs & Continuous TWR Equity History
+     ------------------------------------------------------------------------ */
+  public async getPortfolioEpochs(forceBust = false): Promise<PortfolioEpochsResponse> {
+    try {
+      return await this.requestWithAuth<PortfolioEpochsResponse>(
+        '/api/v1/portfolio/epochs',
+        {},
+        forceBust
+      );
+    } catch {
+      this.isUsingFallback = true;
+      return {
+        active_epoch_id: 2,
+        active_epoch_alias: 'ATR 2.5x Calibration',
+        state_revision_id: 'epoch_2_20250512T213000Z',
+        epochs: SANDBOX_EPOCHS,
+      };
+    }
+  }
+
+  public async getEquityHistory(forceBust = false): Promise<EquityHistoryResponse> {
+    try {
+      return await this.requestWithAuth<EquityHistoryResponse>(
+        '/api/v1/portfolio/equity-history',
+        {},
+        forceBust
+      );
+    } catch {
+      this.isUsingFallback = true;
+      return {
+        active_epoch_id: 2,
+        active_epoch_alias: 'ATR 2.5x Calibration',
+        state_revision_id: 'epoch_2_20250512T213000Z',
+        points: SANDBOX_EQUITY_HISTORY,
+      };
     }
   }
 
@@ -1277,6 +1517,7 @@ export class SirixApiClient {
           TIME_BARRIER: 'TIME_BARRIER_EXPIRED',
           EARNINGS_BLACKOUT: 'EARNINGS_BLACKOUT_EXIT',
           KILL_SWITCH: 'KILL_SWITCH_LIQUIDATION',
+          EPOCH_RESET_LIQUIDATION: 'EPOCH_RESET_LIQUIDATION',
         };
 
         const trades: ClosedTradeRecord[] = rawItems.map((item) => {
@@ -1352,10 +1593,14 @@ export class SirixApiClient {
   /* ------------------------------------------------------------------------
      6. User Preferences & Guardrails (GET / PATCH /api/v1/preferences)
      ------------------------------------------------------------------------ */
-  public async getPreferences(): Promise<UserPreferencesResponse> {
+  public async getPreferences(forceBust = false): Promise<UserPreferencesResponse> {
     const cached = loadSnapshotCache<UserPreferencesResponse>('user_prefs');
     try {
-      const raw = await this.requestWithAuth<Record<string, unknown>>('/api/v1/preferences');
+      const raw = await this.requestWithAuth<Record<string, unknown>>(
+        '/api/v1/preferences',
+        {},
+        forceBust
+      );
       const normalized = this.normalizePreferencesPayload(raw);
       saveSnapshotCache('user_prefs', normalized);
       return normalized;

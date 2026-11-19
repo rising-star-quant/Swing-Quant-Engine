@@ -20,13 +20,16 @@ try:
         AuditTradeExitReasonLiteral,
         AuthSessionStatusResponse,
         EODExecutionStatus,
+        EpochMarkerSchema,
         EquityCurvePointDTO,
+        EquityHistoryPointSchema,
         ExitReason,
         IndexSourceLiteral,
         InternalTriggerEODResponse,
         LoginRequest,
         LoginResponse,
         MultiTenantStateStoreSchema,
+        PortfolioEpochsStoreSchema,
         PortfolioSummaryResponse,
         SystemHealthTelemetry,
         TripleBarrierPositionSchema,
@@ -59,13 +62,16 @@ except ImportError:
         AuditTradeExitReasonLiteral,
         AuthSessionStatusResponse,
         EODExecutionStatus,
+        EpochMarkerSchema,
         EquityCurvePointDTO,
+        EquityHistoryPointSchema,
         ExitReason,
         IndexSourceLiteral,
         InternalTriggerEODResponse,
         LoginRequest,
         LoginResponse,
         MultiTenantStateStoreSchema,
+        PortfolioEpochsStoreSchema,
         PortfolioSummaryResponse,
         SystemHealthTelemetry,
         TripleBarrierPositionSchema,
@@ -135,6 +141,8 @@ def _map_index_source(raw_index: Optional[str]) -> IndexSourceLiteral:
 def _map_exit_reason(raw_reason: ExitReason | str) -> AuditTradeExitReasonLiteral:
     value = raw_reason.value if isinstance(raw_reason, ExitReason) else str(raw_reason)
     normalized = value.strip().upper()
+    if normalized == "EPOCH_RESET_LIQUIDATION":
+        return "EPOCH_RESET_LIQUIDATION"
     if normalized in {"UPPER_BARRIER_TP", "TAKE_PROFIT"}:
         return "TAKE_PROFIT"
     if normalized in {"LOWER_BARRIER_SL", "TRAILING_STOP", "CHANDELIER_STOP", "RATCHET_STOP"}:
@@ -315,7 +323,10 @@ def create_app(
     static_gui_dir: Optional[Path] = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
-    resolved_reader = state_reader or StatelessGCSStateReader(settings=resolved_settings)
+    resolved_reader = state_reader or StatelessGCSStateReader(
+        settings=resolved_settings,
+        cache_ttl_seconds=0.0,
+    )
     resolved_sessions = session_manager or SingleOriginCookieSessionManager(settings=resolved_settings)
     resolved_limiter = rate_limiter or SlidingWindowLoginRateLimiter()
     resolved_static_dir = (
@@ -326,7 +337,7 @@ def create_app(
 
     fastapi_app = FastAPI(
         title="SIRIX Quantitative Portfolio Telemetry API",
-        version="2.0.0",
+        version="2.1.0",
         description="Unified Single-Origin Cloud Run & GCS Read-Only Quantitative Telemetry Server",
         docs_url=None if resolved_settings.environment == "production" else "/api/docs",
         redoc_url=None,
@@ -338,6 +349,23 @@ def create_app(
     fastapi_app.state.session_manager = resolved_sessions
     fastapi_app.state.rate_limiter = resolved_limiter
     fastapi_app.state.static_gui_dir = resolved_static_dir
+
+    # E.1 Layer 2 Cache Invalidation Middleware (Stateless Cloud Run Headers)
+    @fastapi_app.middleware("http")
+    async def attach_e1_cache_headers(request: Request, call_next: Any) -> Response:
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            try:
+                epoch_id, _epoch_alias, state_rev = request.app.state.state_reader.read_state_revision()
+                response.headers["X-SIRIX-Epoch-ID"] = str(epoch_id)
+                response.headers["X-SIRIX-State-Rev"] = str(state_rev)
+            except Exception as rev_err:
+                logger.debug(f"Epoch revision header fallback: {rev_err}")
+                response.headers.setdefault("X-SIRIX-Epoch-ID", "1")
+                response.headers.setdefault("X-SIRIX-State-Rev", "epoch_1_genesis")
+        return response
 
     # -------------------------------------------------------------------------
     # Global Exception Handlers (Strict Edge-State HTTP Mapping)
@@ -613,13 +641,31 @@ def create_app(
                 for raw_pt in raw_points:
                     if not isinstance(raw_pt, dict):
                         raise MalformedStateError("Each equity curve entry must be a JSON object.")
+                    raw_marker = raw_pt.get("epoch_marker")
+                    parsed_marker = (
+                        EpochMarkerSchema(
+                            epoch_id=int(raw_marker["epoch_id"]),
+                            alias=str(raw_marker["alias"]),
+                        )
+                        if isinstance(raw_marker, dict) and raw_marker.get("epoch_id") and raw_marker.get("alias")
+                        else None
+                    )
+                    nav_val = float(raw_pt.get("portfolio_nav") or raw_pt.get("raw_portfolio_value") or 100000.0)
                     validated_points.append(
                         EquityCurvePointDTO(
                             date=str(raw_pt["date"]),
-                            portfolio_nav=float(raw_pt["portfolio_nav"]),
+                            portfolio_nav=nav_val,
                             benchmark_iwm_norm=float(raw_pt.get("benchmark_iwm_norm", 100.0)),
                             benchmark_mdy_norm=float(raw_pt.get("benchmark_mdy_norm", 100.0)),
                             heat_pct=min(15.0, max(0.0, float(raw_pt.get("heat_pct", 0.0)))),
+                            raw_portfolio_value=float(raw_pt.get("raw_portfolio_value", nav_val)),
+                            cumulative_algo_return_pct=(
+                                float(raw_pt["cumulative_algo_return_pct"])
+                                if raw_pt.get("cumulative_algo_return_pct") is not None
+                                else None
+                            ),
+                            epoch_id=int(raw_pt.get("epoch_id", 1)),
+                            epoch_marker=parsed_marker,
                         )
                     )
             except (KeyError, TypeError, ValueError) as exc:
@@ -639,8 +685,69 @@ def create_app(
                 benchmark_iwm_norm=100.0,
                 benchmark_mdy_norm=100.0,
                 heat_pct=summary.portfolio_heat_pct,
+                raw_portfolio_value=summary.total_equity_usd,
+                cumulative_algo_return_pct=summary.cumulative_return_pct,
+                epoch_id=state.epoch_id,
+                epoch_marker=None,
             )
         ]
+
+    @fastapi_app.get(
+        "/api/portfolio/epochs",
+        response_model=PortfolioEpochsStoreSchema,
+        status_code=status.HTTP_200_OK,
+    )
+    async def get_portfolio_epochs(
+        _session: Dict[str, Any] = Depends(require_authenticated_session),
+        reader: StatelessGCSStateReader = Depends(get_reader),
+    ) -> PortfolioEpochsStoreSchema:
+        raw_epochs, _backend = reader.read_portfolio_epochs()
+        return PortfolioEpochsStoreSchema.model_validate(raw_epochs)
+
+    @fastapi_app.get(
+        "/api/portfolio/equity-history",
+        response_model=List[EquityHistoryPointSchema],
+        status_code=status.HTTP_200_OK,
+    )
+    async def get_equity_history(
+        _session: Dict[str, Any] = Depends(require_authenticated_session),
+        reader: StatelessGCSStateReader = Depends(get_reader),
+    ) -> List[EquityHistoryPointSchema]:
+        raw_points, _backend = reader.read_equity_history()
+        validated: List[EquityHistoryPointSchema] = []
+        for raw_pt in raw_points:
+            if not isinstance(raw_pt, dict) or not raw_pt.get("date"):
+                continue
+            raw_val = float(raw_pt.get("raw_portfolio_value") or raw_pt.get("portfolio_nav") or DEFAULT_INITIAL_EQUITY_USD)
+            cum_ret = float(
+                raw_pt.get(
+                    "cumulative_algo_return_pct",
+                    round(((raw_val - DEFAULT_INITIAL_EQUITY_USD) / DEFAULT_INITIAL_EQUITY_USD) * 100.0, 4),
+                )
+            )
+            raw_marker = raw_pt.get("epoch_marker")
+            marker = (
+                EpochMarkerSchema(
+                    epoch_id=int(raw_marker["epoch_id"]),
+                    alias=str(raw_marker["alias"]),
+                )
+                if isinstance(raw_marker, dict) and raw_marker.get("epoch_id") and raw_marker.get("alias")
+                else None
+            )
+            validated.append(
+                EquityHistoryPointSchema(
+                    date=str(raw_pt["date"]),
+                    raw_portfolio_value=round(raw_val, 2),
+                    cumulative_algo_return_pct=round(cum_ret, 4),
+                    epoch_id=int(raw_pt.get("epoch_id", 1)),
+                    epoch_marker=marker,
+                    heat_pct=min(15.0, max(0.0, float(raw_pt.get("heat_pct", 0.0)))),
+                    benchmark_iwm_norm=float(raw_pt.get("benchmark_iwm_norm", 100.0)),
+                    benchmark_mdy_norm=float(raw_pt.get("benchmark_mdy_norm", 100.0)),
+                )
+            )
+        validated.sort(key=lambda pt: pt.date)
+        return validated
 
     @fastapi_app.get(
         "/api/portfolio/audit-ledger",

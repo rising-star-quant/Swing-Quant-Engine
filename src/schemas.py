@@ -410,6 +410,7 @@ class ExitReason(str, Enum):
     LOWER_BARRIER_SL = "LOWER_BARRIER_SL"
     VERTICAL_BARRIER_TIME = "VERTICAL_BARRIER_TIME"
     SYSTEM_CIRCUIT_BREAKER = "SYSTEM_CIRCUIT_BREAKER"
+    EPOCH_RESET_LIQUIDATION = "EPOCH_RESET_LIQUIDATION"
 
 
 class TripleBarrierPositionSchema(BaseModel):
@@ -785,8 +786,25 @@ class MultiTenantStateStoreSchema(BaseModel):
     and all isolated tenant portfolio ledgers.
     """
     schema_version: str = Field(
-        default="2.0.0",
+        default="2.1.0",
         description="State persistence format schema version.",
+    )
+    epoch_id: int = Field(
+        default=1,
+        ge=1,
+        description="Active monotonic Portfolio Epoch sequence identifier (E.1).",
+    )
+    epoch_alias: str = Field(
+        default="Genesis Epoch",
+        min_length=1,
+        max_length=100,
+        description="Human-readable alias for the active Portfolio Epoch (E.1).",
+    )
+    state_revision_id: str = Field(
+        default="epoch_1_genesis",
+        min_length=3,
+        max_length=128,
+        description="Unique state revision stamp updated on every EOD run or Epoch reset (E.1).",
     )
     last_updated_utc: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
@@ -831,7 +849,75 @@ AuditTradeExitReasonLiteral = Literal[
     "RATCHET_STOP",
     "TIME_BARRIER_14D",
     "SPLIT_ADJUSTED_EXIT",
+    "EPOCH_RESET_LIQUIDATION",
 ]
+
+
+# =============================================================================
+# 6A. E.1 PORTFOLIO EPOCH, CONTINUOUS TWR EQUITY HISTORY & STATE REVISION
+# =============================================================================
+
+
+class EpochMarkerSchema(BaseModel):
+    """Milestone marker injected exclusively on Epoch Reset dates in equity_history.json."""
+
+    epoch_id: int = Field(..., ge=1)
+    alias: str = Field(..., min_length=3, max_length=100)
+
+
+class PortfolioEpochRecordSchema(BaseModel):
+    """Single portfolio measurement period persisted in portfolio_epochs.json (E.1 Section 2.1)."""
+
+    epoch_id: int = Field(..., ge=1)
+    epoch_alias: str = Field(..., min_length=3, max_length=100)
+    reset_timestamp_utc: str = Field(..., min_length=10)
+    closing_equity_before_reset: Optional[float] = Field(default=None, ge=0.0)
+    starting_equity: float = Field(default=100_000.0, gt=0.0)
+    positions_liquidated_count: int = Field(default=0, ge=0)
+    triggered_by: Literal[
+        "GENESIS",
+        "GITHUB_ACTIONS_MANUAL",
+        "PWA_AUTHORIZED_USER",
+    ] = Field(default="GITHUB_ACTIONS_MANUAL")
+    closed_at_utc: Optional[str] = Field(default=None)
+    epoch_return_pct: Optional[float] = Field(default=None)
+
+
+class PortfolioEpochsStoreSchema(BaseModel):
+    """Canonical GCS container for portfolio_epochs.json (E.1)."""
+
+    active_epoch_id: int = Field(default=1, ge=1)
+    active_epoch_alias: str = Field(default="Genesis Epoch", min_length=3, max_length=100)
+    state_revision_id: str = Field(default="epoch_1_genesis", min_length=3, max_length=128)
+    epochs: List[PortfolioEpochRecordSchema] = Field(default_factory=list)
+
+
+class EquityHistoryPointSchema(BaseModel):
+    """Continuous Time-Weighted Return (TWR) daily equity sample for equity_history.json (E.1 Section 2.2)."""
+
+    date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    raw_portfolio_value: float = Field(..., gt=0.0)
+    cumulative_algo_return_pct: float = Field(default=0.0)
+    epoch_id: int = Field(default=1, ge=1)
+    epoch_marker: Optional[EpochMarkerSchema] = Field(default=None)
+    heat_pct: float = Field(default=0.0, ge=0.0, le=15.0)
+    benchmark_iwm_norm: float = Field(default=100.0, gt=0.0)
+    benchmark_mdy_norm: float = Field(default=100.0, gt=0.0)
+
+
+class StateRevisionMetadataSchema(BaseModel):
+    """Root state.json revision and operational readiness metadata (E.1 Section 2.3)."""
+
+    state_revision_id: str = Field(..., min_length=3, max_length=128)
+    epoch_id: int = Field(..., ge=1)
+    epoch_alias: str = Field(..., min_length=3, max_length=100)
+    last_updated_utc: str = Field(..., min_length=10)
+    cash_balance: float = Field(default=100_000.0, ge=0.0)
+    total_equity: float = Field(default=100_000.0, gt=0.0)
+    portfolio_heat_pct: float = Field(default=0.0, ge=0.0, le=15.0)
+    open_positions_count: int = Field(default=0, ge=0)
+    kill_switch_status: str = Field(default="ARMED_READY")
+    kill_switch_active: bool = Field(default=False)
 
 
 class SystemHealthTelemetry(BaseModel):
@@ -926,13 +1012,17 @@ class PortfolioSummaryResponse(BaseModel):
 
 
 class EquityCurvePointDTO(BaseModel):
-    """F01 Section 2.C historical portfolio NAV & benchmark point (`GET /api/portfolio/equity-curve`)."""
+    """F01 Section 2.C & E.1 historical portfolio NAV, TWR & benchmark point (`GET /api/portfolio/equity-curve`)."""
 
     date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
     portfolio_nav: float = Field(..., gt=0)
     benchmark_iwm_norm: float = Field(..., gt=0)
     benchmark_mdy_norm: float = Field(..., gt=0)
     heat_pct: float = Field(..., ge=0.0, le=15.0)
+    raw_portfolio_value: Optional[float] = Field(default=None, gt=0)
+    cumulative_algo_return_pct: Optional[float] = Field(default=None)
+    epoch_id: int = Field(default=1, ge=1)
+    epoch_marker: Optional[EpochMarkerSchema] = Field(default=None)
 
 
 class AuditTradeDTO(BaseModel):

@@ -8,9 +8,15 @@ import {
   LogOut,
   Wifi,
   Database,
+  RefreshCw,
+  Flag,
+  X,
 } from 'lucide-react';
 import {
   AccountTier,
+  EpochChangeEvent,
+  EquityHistoryPoint,
+  PortfolioEpochRecord,
   PortfolioOverviewResponse,
   PositionDeepDiveResponse,
 } from './types/sirix';
@@ -35,11 +41,15 @@ const SirixTerminalShell: React.FC = () => {
     switchTier,
     logout,
   } = useAuth();
-  const { preferences, t } = usePreferences();
+  const { preferences, refreshPreferences, t } = usePreferences();
 
   const [activeTab, setActiveTab] = useState<ActiveWorkspaceTab>('portfolio');
   const [overview, setOverview] = useState<PortfolioOverviewResponse | null>(null);
+  const [equityHistory, setEquityHistory] = useState<EquityHistoryPoint[]>([]);
+  const [epochs, setEpochs] = useState<PortfolioEpochRecord[]>([]);
   const [loadingOverview, setLoadingOverview] = useState<boolean>(true);
+  const [forceSyncing, setForceSyncing] = useState<boolean>(false);
+  const [epochToast, setEpochToast] = useState<EpochChangeEvent | null>(null);
 
   const [selectedTicker, setSelectedTicker] = useState<string | null>('CELH');
   const [deepDive, setDeepDive] = useState<PositionDeepDiveResponse | null>(null);
@@ -49,31 +59,80 @@ const SirixTerminalShell: React.FC = () => {
 
   const killSwitchActive = preferences.guardrails.kill_switch_active;
 
-  // Fetch Portfolio Overview
-  const fetchOverview = useCallback(async () => {
-    setLoadingOverview(true);
-    try {
-      const data = await sirixClient.getPortfolioOverview(killSwitchActive);
-      setOverview(data);
-      if (data.holdings.length > 0) {
-        const currentValid = data.holdings.some((h) => h.ticker === selectedTicker);
-        if (!currentValid) {
-          setSelectedTicker(data.holdings[0].ticker);
+  // Fetch Portfolio Overview + E.1 Epochs & Continuous TWR Equity History
+  const fetchOverview = useCallback(
+    async (forceBust = false) => {
+      setLoadingOverview(true);
+      try {
+        const [data, epochsRes, historyRes] = await Promise.all([
+          sirixClient.getPortfolioOverview(killSwitchActive, forceBust),
+          sirixClient.getPortfolioEpochs(forceBust),
+          sirixClient.getEquityHistory(forceBust),
+        ]);
+        setOverview(data);
+        setEpochs(epochsRes.epochs || []);
+        setEquityHistory(historyRes.points || []);
+        if (data.holdings.length > 0) {
+          setSelectedTicker((prev) =>
+            prev && data.holdings.some((h) => h.ticker === prev) ? prev : data.holdings[0].ticker
+          );
+        } else {
+          setSelectedTicker(null);
+          setDeepDive(null);
         }
-      } else {
-        setSelectedTicker(null);
-        setDeepDive(null);
+      } finally {
+        setLoadingOverview(false);
       }
+    },
+    [killSwitchActive]
+  );
+
+  // E.1 Manual Force Sync Button (clears localStorage cache + appends ?t=<timestamp>)
+  const handleForceSync = useCallback(async () => {
+    if (forceSyncing) return;
+    setForceSyncing(true);
+    try {
+      sirixClient.clearLocalCache();
+      await Promise.all([refreshPreferences(), fetchOverview(true)]);
     } finally {
-      setLoadingOverview(false);
+      setForceSyncing(false);
     }
-  }, [killSwitchActive, selectedTicker]);
+  }, [forceSyncing, refreshPreferences, fetchOverview]);
 
   useEffect(() => {
     if (isAuthenticated) {
-      fetchOverview();
+      fetchOverview(false);
     }
   }, [isAuthenticated, accountTier, simulateDefensiveCash, killSwitchActive, fetchOverview]);
+
+  // E.1 Layer 4: Epoch-Change Guard Subscriber (reset React state + display New Epoch Toast)
+  useEffect(() => {
+    const unsubscribe = sirixClient.subscribeEpochChange((event) => {
+      setOverview(null);
+      setDeepDive(null);
+      setSelectedTicker(null);
+      setEquityHistory([]);
+      setEpochs([]);
+      setEpochToast(event);
+      void refreshPreferences();
+      void fetchOverview(true);
+    });
+    return unsubscribe;
+  }, [refreshPreferences, fetchOverview]);
+
+  // E.1 Layer 4: Re-check Server Epoch / Revision on visibilitychange (iPhone / Chromebook wake)
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void fetchOverview(true);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [isAuthenticated, fetchOverview]);
 
   // Fetch Deep Dive when selectedTicker or accountTier changes
   useEffect(() => {
@@ -236,6 +295,21 @@ const SirixTerminalShell: React.FC = () => {
 
             <button
               type="button"
+              onClick={handleForceSync}
+              disabled={forceSyncing}
+              title="Force Sync (Clear local cache & fetch fresh state from GCS)"
+              className="px-2.5 py-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-canvas)] hover:border-[var(--accent-brand)] text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+            >
+              <RefreshCw
+                className={`w-3.5 h-3.5 text-[var(--accent-brand)] ${
+                  forceSyncing ? 'animate-spin' : ''
+                }`}
+              />
+              <span className="hidden sm:inline">Force Sync</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => setAuditDrawerOpen(true)}
               className="px-2.5 py-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-canvas)] hover:border-[var(--border-strong)] text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer"
             >
@@ -245,6 +319,38 @@ const SirixTerminalShell: React.FC = () => {
           </div>
         </header>
 
+        {/* E.1 Layer 4 New Epoch Toast Banner */}
+        {epochToast && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="mx-4 sm:mx-6 mt-3 rounded-xl border border-[var(--accent-brand)] bg-[var(--accent-brand-subtle)] px-4 py-2.5 flex items-center justify-between gap-3 text-xs"
+          >
+            <div className="flex items-center gap-2.5 text-[var(--text-primary)]">
+              <Flag className="w-4 h-4 text-[var(--accent-brand)] shrink-0" />
+              <span>
+                <strong className="text-[var(--accent-brand)]">
+                  New Portfolio Epoch Activated:
+                </strong>{' '}
+                Epoch #{epochToast.newEpochId} • {epochToast.newEpochAlias} (Local cache purged &amp;
+                synced to fresh GCS revision{' '}
+                <code dir="ltr" className="font-mono-tabular">
+                  {epochToast.newStateRev}
+                </code>
+                )
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setEpochToast(null)}
+              aria-label="Dismiss epoch notification"
+              className="p-1 rounded-md text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
         {/* Workspace Container */}
         <main className="flex-1 p-4 sm:p-6 max-w-[1600px] w-full mx-auto">
           {activeTab === 'portfolio' && (
@@ -253,6 +359,8 @@ const SirixTerminalShell: React.FC = () => {
               <div className="lg:col-span-5">
                 <PortfolioHomeView
                   overview={overview}
+                  equityHistory={equityHistory}
+                  epochs={epochs}
                   loading={loadingOverview}
                   selectedTicker={selectedTicker}
                   onSelectTicker={handleSelectHolding}

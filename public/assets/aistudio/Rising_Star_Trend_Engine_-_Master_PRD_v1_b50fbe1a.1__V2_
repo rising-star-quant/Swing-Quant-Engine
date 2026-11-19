@@ -1,0 +1,52 @@
+﻿Financial Signal Engine: Rising Star Trend Engine (Master PRD v1.1)
+1. Executive Summary & Background
+The Rising Star Trend Engine is a real-time algorithmic engine designed to identify, monitor, and alert on stocks transitioning from mid-cap growth status to inclusion in the S&P 500 index. This document outlines the updated product requirements, technical architecture, and business logic for version 1.1, incorporating advanced technical indicators, dynamic volatility-based risk management, and the integrated ScoringEngine logic.
+
+
+________________
+
+
+2. Core Architecture & Micro-Modules
+The system is built on an event-driven micro-module architecture:
+
+
+1. DataConnector: Ingestion micro-module interfacing with external APIs (Financial Modeling Prep, Polygon.io, SEC EDGAR, yfinance) and standardizing normalized schemas (MarketDataPayload).
+2. RuleEngine: Stateless evaluation engine running isolated S&P eligibility gate logic (US incorporation, market cap >= $18B, liquidity, public float, GAAP profitability).
+3. IndicatorEngine (v1.1 Updated): Atomic quantitative module calculating technical series, moving average trends (EMA(50), SMA(200)), momentum filters (RSI(14), MACD), volume accumulation metrics, and ATR volatility.
+4. ScoringEngine (v1.1 Updated): Synthesizes outputs from RuleEngine and IndicatorEngine into a normalized composite Rising Star Score (0–100) with weighted sub-scores and BUY ALERT triggers.
+5. RiskGuard (v1.1 Updated): Autonomous exit and risk management module managing dynamic ATR Stop Loss (1.5 * ATR) and Take Profit (3.0 * ATR) targets, trailing stop-losses, MA50 volume breakdowns, and 60-day holding timeouts.
+6. NotificationHub: Multi-channel dispatch micro-module distributing structured alerts via Telegram with Redis-based idempotency.
+
+
+________________
+
+
+3. Detailed v1.1 Strategy Specifications
+3.1 Multi-Indicator Trend & Momentum Filtering (IndicatorEngine)
+* EMA/SMA Trend Alignment: Entry triggers require Price > EMA(50) AND EMA(50) > SMA(200) to strictly confirm institutional uptrends.
+* Momentum Filter (RSI & MACD):
+   * Reject BUY ALERTS if RSI(14) > 70 (overbought filter).
+   * Confirm positive momentum with MACD Line > Signal Line and an expanding upward histogram.
+3.2 Dynamic Risk Management (RiskGuard & ATR Integration)
+* ATR Sizing: Compute 14-period Average True Range (ATR(14)) per ticker.
+* Dynamic Stop Loss: Current Price - (1.5 * ATR).
+* Dynamic Take Profit: Current Price + (3.0 * ATR) (maintaining a 1:2 Risk/Reward ratio).
+* Guardrails: Fallback to 10% trailing stop or trigger exit on MA50 breakdown accompanied by a >20% volume surge.
+3.3 Composite Scoring System (ScoringEngine)
+* Fundamental Gate: If is_eligible == False from RuleEngine, total score is forced to 0.
+* Weighted Sub-Scores (0–100 Scale):
+   * Technical Trend Alignment (EMA/SMA & Breakout): 35 points
+   * Momentum & Volume Structure (MACD, RSI, Accumulation Surge): 35 points
+   * Sector Sentiment & Dynamic Weighting: 20 points
+   * Short Interest Filter: 10 points
+* Trigger Condition: Trigger BUY ALERT only when Composite Score >= 75 AND breakout_triggered == True.
+
+
+________________
+
+
+4. Automation & GitHub Actions CI/CD
+* Scheduled Execution: Cron-based daily runs (23:00 UTC, Mon-Fri) via .github/workflows/market_scanner.yml.
+* Secret Integration: Secure injection of TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID for instant alerts.
+5. System Extensions & Linked PRDs
+* [E.1 - PRD: Portfolio Epoch Reset & Cache Invalidation](https://docs.google.com/document/d/1Av5CyLyd3Ixzr2Jgk2SZMKH5GWzy6f1f5n8m9UEgtwI/edit?usp=drive_web): Defines controlled virtual portfolio resets ($100,000 baseline) via GitHub Actions, continuous Time-Weighted Return (TWR) equity curve tracking with epoch markers, and a 4-layer cache invalidation strategy across GCS, Cloud Run, Service Worker, and PWA client state.

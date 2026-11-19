@@ -1,0 +1,92 @@
+﻿E.1 - PRD: איפוס תיק וירטואלי, רציפות עקומת הון וביטול מטמון (Portfolio Epoch Reset & Multi-Layer Cache Invalidation)
+מערכת: SIRIX (Autonomous Quantitative Trading Engine)
+גרסת מסמך: 1.0 (Extension E.1)
+תאריך: נובמבר 2026
+עקרונות יסוד: Headless Architecture, Zero-Override, Single Source of Truth (GCS), Browser-First (GitHub Web UI)
+1. תקציר מנהלים ויעדי האפיון
+מסמך זה מגדיר את הרחבה E.1 למערכת SIRIX. מטרת ההרחבה היא לאפשר למשתמש לבצע איפוס מבוקר של תיק ההשקעות הווירטואלי (סגירת כל הפוזיציות הפתוחות והחזרת יתרת המזומן ל-$100,000.00), תוך שמירה מלאה על רציפות גרף הביצועים ההיסטורי כהוכחת היתכנות סטטיסטית (Track Record Proof) לאלגוריתם לאורך זמן.
+* שמירה על עקרון Zero-Override: האיפוס אינו מאפשר סגירה סלקטיבית של נכס בודד או עקיפה ידנית של כללי המסחר, אלא מבצע איפוס מערכתי כולל (Hard Epoch Reset) הפותח תקופת מדידה חדשה (Epoch) עם הון התחלתי נקי.
+* הפרדת שכבות הנתונים (Active State vs. Continuous Ledger): הפרדה מוחלטת בין מצב התיק הפעיל שמתאפס (יתרה ופוזיציות) לבין עקומת התשואה המצטברת שממשיכה לחיות ברצף ומציגה תגיות ציון דרך (Epoch Markers) בנקודות האיפוס.
+* מניעת טעויות אנוש (Two-Phase Rollout): בשלב א' (המוגדר במסמך זה), פעולת האיפוס מוגבלת להרצה ידנית מתוך GitHub Actions בלבד עם מנגנון אימות כפול. בשלב ב' עתידי תיפתח האפשרות מתוך אפליקציית ה-PWA.
+* סנכרון מטמון מקצה לקצה (4-Layer Cache Invalidation): הבטחה שביצוע איפוס ישתקף מיידית ב-PWA ללא תלות ב-Cache מקומי בדפדפן, ב-Service Worker, ב-Cloud Run או ב-GCS.
+2. מודל הנתונים וחוזי ממשק ב-GCS (Single Source of Truth)
+כדי למנוע עיוות בגרף הביצועים בעת החזרת היתרה ל-118,000 ל-$100,000 ייראה כצניחה של -15.25%), המערכת תנהל שני קובצי מדידה משלימים ב-Google Cloud Storage.
+2.1 ישות תקופות מסחר (portfolio_epochs.json)
+כל פעולת איפוס סוגרת את ה-Epoch הנוכחי ופותחת רשומת Epoch חדשה:
+שם שדה (Field)
+	סוג (Type)
+	תיאור ודוגמה
+ 
+	epoch_id
+	integer
+	מזהה רץ חד-ערכי של תקופת המסחר (1, 2, 3...)
+	epoch_alias
+	string
+	כינוי התקופה כפי שהוזן בעת האיפוס (לדוגמה: "ATR 2.5x Calibration")
+	reset_timestamp_utc
+	ISO-8601
+	חותמת זמן מדויקת של ביצוע האיפוס
+	closing_equity_before_reset
+	float
+	שווי התיק הכולל רגע לפני האיפוס (מזומן + שווי פוזיציות שנסגרו)
+	starting_equity
+	float
+	הון התחלתי חדש של התקופה (100000.00)
+	positions_liquidated_count
+	integer
+	כמות הפוזיציות הפתוחות שנסגרו אוטומטית בעת האיפוס
+	triggered_by
+	string
+	מקור הפעולה (בשלב א': "GITHUB_ACTIONS_MANUAL"; בשלב ב': "PWA_AUTHORIZED_USER")
+	
+
+2.2 שמירת רציפות עקומת ההון (equity_history.json)
+כל רשומת דגימה יומית ב-equity_history.json תורחב כך שתתמוך הן בערך הדולרי של ה-Epoch הנוכחי והן בתשואה הרציפה של האלגוריתם מתחילת חיי המערכת:
+* raw_portfolio_value (float): השווי הדולרי האמיתי של התיק באותה נקודת זמן (מתאפס ל-100000.00 ביום האיפוס).
+* cumulative_algo_return_pct (float - TWR): התשואה המצטברת המשורשרת (Time-Weighted Return) מתחילת פעילות האלגוריתם (0.00% ביום ההקמה הראשוני). ביום האיפוס התשואה היומית של פעולת האיפוס עצמה מחושבת כ-0.00%, והעקומה ממשיכה להשתרשר מהנקודה המדויקת שבה עצרה לפני האיפוס.
+* epoch_id (integer): שיוך הנקודה לתקופת המסחר הרלוונטית.
+* epoch_marker (object | null): אובייקט המאוכלס אך ורק בנקודת האיפוס ({"epoch_id": 2, "alias": "Post-Slippage Fix"}) ומשמש את ה-PWA לציור קו אנכי ותגית על הגרף.
+2.3 חותמת גרסת מצב (state_revision_id)
+קובץ ה-State המרכזי (state.json) יכלול ברמת השורש מזהה גרסה ייחודי המתעדכן בכל כתיבה (הרצת EOD או איפוס):
+"state_revision_id": "epoch_2_20261119T211500Z"
+3. אוטומציה ותהליך איפוס ב-GitHub Actions (שלב א')
+כדי להתאים לעבודה מלאה מ-Chromebook ו-iPhone דרך GitHub Web UI ללא כלי CLI מקומיים, יוקם Workflow ייעודי: .github/workflows/reset_portfolio.yml.
+3.1 פרמטרי קלט ומנגנון הגנה כפול (workflow_dispatch)
+1. epoch_alias (string, required): כינוי התקופה החדשה. סקריפט האיפוס יאכוף אורך מינימלי של 3 תווים וללא תווים מיוחדים מסוכנים.
+2. confirm_reset (string, required): מנגנון מניעת טעות אנוש. המשתמש חייב להקליד במדויק את המחרוזת RESET. כל ערך אחר יפיל את הריצה מידית לפני גישה ל-GCS.
+3.2 זרימת הטרנזקציה האטומית (scripts/reset_portfolio.py)
+1. יצירת גיבוי (Pre-Reset Snapshot): העתקת כל קובצי ה-State הנוכחיים ב-GCS לנתיב גיבוי מבודד backups/pre_reset_epoch_{old_id}_{timestamp}/.
+2. סגירת פוזיציות פתוחות (Force Liquidation): מעבר על כל הפוזיציות הפתוחות ב-active_positions, משיכת מחיר סגירה אחרון (או מחיר Mark-to-Market אחרון השמור ב-State), ורישום כל עסקה ב-trade_history.json עם סיבת יציאה ייעודית: EPOCH_RESET_LIQUIDATION.
+3. חישוב שווי סגירה ונעילת Epoch קודם: חישוב closing_equity_before_reset ועדכון רשומת ה-Epoch הקודם ב-portfolio_epochs.json.
+4. אתחול מצב התיק החדש: ניקוי active_positions לרשימה ריקה ([]), איפוס cash_balance ל-100000.00, איפוס portfolio_heat ל-0.00%, ויצירת רשומת Epoch חדשה (epoch_id + 1).
+5. עדכון עקומת ההון: הוספת נקודת ציון ל-equity_history.json עם raw_portfolio_value = 100000.00, שמירה על הערך האחרון של cumulative_algo_return_pct, והזרקת epoch_marker.
+6. התראת טלגרם (NotificationHub): שליחת כרטיס סיכום מובנה לטלגרם המפרט את ה-Epoch שנסגר, תשואתו הסופית, הפוזיציות שנסגרו, ופתיחת ה-Epoch החדש עם $100,000.00.
+4. אסטרטגיית ביטול מטמון מקצה לקצה (4-Layer Cache Invalidation)
+כדי להבטיח שאיפוס התיק ב-GCS ישתקף מיידית ב-PWA ולא יוסתר על ידי נתונים ישנים השמורים במטמון מקומי או בענן, ייאכפו הכללים הבאים בכל 4 שכבות המערכת:
+שכבה ארכיטקטונית
+	מנגנון ביטול מטמון וסנכרון (Cache Invalidation Policy)
+ 
+	1. Google Cloud Storage (GCS)
+	הגדרת כותרת מטא-דאטה Cache-Control: no-cache, no-store, must-revalidate, max-age=0 בעת העלאת קובצי ה-JSON, למניעת שמירת עותקים ישנים ב-Edge Cache של גוגל.
+	2. Cloud Run (FastAPI)
+	שרת Stateless ללא שמירת State בזיכרון. כל תגובת API של טלמטריה/תיק תחזיר את הכותרות Cache-Control: no-store, max-age=0, X-SIRIX-Epoch-ID ו-X-SIRIX-State-Rev.
+	3. PWA Service Worker
+	החרגת נתיבי /api/* ממטמון האופליין והגדרתם במדיניות Network-Only. קבצים סטטיים (JS/CSS/Icons) ימשיכו לפעול ב-Stale-While-Revalidate.
+	4. Browser / Client State
+	מימוש Epoch-Change Guard: ה-PWA משווה בכל טעינה או חזרה מרקע (visibilitychange) בין epoch_id ו-state_revision_id מהשרת לבין השמור ב-localStorage. בעת זיהוי שינוי, המערכת מוחקת אוטומטית את מפתחות המטמון הישנים, מאפסת את ה-React State ומציגה הודעת Toast על תחילת ה-Epoch החדש.
+	
+
+5. התאמות ממשק משתמש וטלמטריה ב-PWA
+* תגית Epoch פעילה (Active Epoch Badge): בראש מסך התיק תוצג תגית ברורה עם מספר ה-Epoch והכינוי שלו (לדוגמה: Epoch #2 • ATR 2.5x Calibration) לצד היתרה המעודכנת.
+* גרף התפתחות רציף (Continuous Algo Performance Chart):
+   * תצוגת ברירת מחדל (All-Time Algo Proof): מציגה את עקומת התשואה המצטברת (%) לאורך כל חיי המערכת ברצף. בנקודות האיפוס יצויר קו אנכי מקווקו עם תגית הכינוי (epoch_alias) ו-Tooltip המציג את שווי הסגירה של ה-Epoch הקודם.
+   * בורר תצוגה (Epoch Filter): מתג מעל הגרף המאפשר מעבר בין תצוגת כל התקופות ברצף (All Epochs) לבין תצוגת ערך דולרי ($) של תקופה בודדת בלבד.
+* כפתור סנכרון ידני (Force Sync): כפתור רענון במסך הטלמטריה המבצע קריאת API עם פרמטר עוקף מטמון (?t=<timestamp>) ומנקה את ה-localStorage המקומי.
+6. מפת דרכים לשלב ב' וקריטריוני קבלה (QA Checklist)
+6.1 הרחבה עתידית (שלב ב' – הפעלה מתוך ה-PWA)
+לאחר אימות יציבות התהליך ב-GitHub Actions, יתווסף ב-FastAPI נתיב מאובטח POST /api/v1/portfolio/reset המפעיל את ה-Workflow ב-GitHub דרך REST API (באמצעות Fine-Grained PAT השמור ב-Google Secret Manager), מאחורי חלון אישור כפול במסך ההגדרות של ה-PWA.
+6.2 קריטריוני קבלה (Acceptance Criteria)
+1. הרצת reset_portfolio.yml ללא המילה RESET נכשלת מידית ללא שינוי ב-GCS.
+2. לאחר איפוס תקין עם 3 פוזיציות פתוחות, כל ה-3 נרשמות כסגורות תחת EPOCH_RESET_LIQUIDATION, יתרת המזומן מתאפסת ל-$100,000.00, ו-Portfolio Heat מתאפס ל-0.00%.
+3. עקומת התשואה המצטברת בגרף אינה מציגה צניחה מלאכותית ביום האיפוס, וסמן ה-epoch_alias מופיע בדיוק בנקודת האיפוס.
+4. פתיחת ה-PWA ב-iPhone וב-Chromebook לאחר איפוס מציגה מיידית $100,000.00 ו-0 פוזיציות פתוחות ללא צורך בניקוי היסטוריית דפדפן ידני.

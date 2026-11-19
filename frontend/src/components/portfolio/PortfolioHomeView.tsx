@@ -10,18 +10,24 @@ import {
   TrendingUp,
   TrendingDown,
   Flame,
+  Flag,
 } from 'lucide-react';
 import {
+  EquityHistoryPoint,
   HoldingSummaryCard,
+  PortfolioEpochRecord,
   PortfolioOverviewResponse,
   TimeBarrierUrgency,
 } from '../../types/sirix';
 import { usePreferences } from '../../context/PreferencesContext';
 import { useAuth } from '../../context/AuthContext';
 import { TermTooltip } from '../common/TermTooltip';
+import { ContinuousEquityChart } from './ContinuousEquityChart';
 
 interface PortfolioHomeViewProps {
   overview: PortfolioOverviewResponse | null;
+  equityHistory: EquityHistoryPoint[];
+  epochs: PortfolioEpochRecord[];
   loading: boolean;
   selectedTicker: string | null;
   onSelectTicker: (ticker: string) => void;
@@ -76,6 +82,8 @@ function getUrgencyStyles(urgency: TimeBarrierUrgency): {
 
 export const PortfolioHomeView: React.FC<PortfolioHomeViewProps> = ({
   overview,
+  equityHistory,
+  epochs,
   loading,
   selectedTicker,
   onSelectTicker,
@@ -114,10 +122,18 @@ export const PortfolioHomeView: React.FC<PortfolioHomeViewProps> = ({
         <div className="flex flex-wrap items-start justify-between gap-4">
           {/* Total Equity & Daily / Inception P&L */}
           <div>
-            <div className="flex items-center gap-2 text-xs uppercase tracking-wider text-[var(--text-secondary)] mb-1">
+            <div className="flex flex-wrap items-center gap-2 text-xs uppercase tracking-wider text-[var(--text-secondary)] mb-1.5">
               <span>{t.portfolio.totalEquity}</span>
               <span className="text-[10px] px-2 py-0.5 rounded bg-[var(--bg-canvas)] border border-[var(--border-subtle)] font-mono-tabular text-[var(--text-muted)]">
                 EOD {overview.as_of_timestamp.slice(0, 10)}
+              </span>
+              <span
+                dir="ltr"
+                title={overview.state_revision_id || undefined}
+                className="inline-flex items-center gap-1 text-[10px] normal-case tracking-normal font-semibold px-2 py-0.5 rounded bg-[var(--accent-brand-subtle)] border border-[var(--accent-brand)]/40 font-mono-tabular text-[var(--accent-brand)]"
+              >
+                <Flag className="w-3 h-3" />
+                Epoch #{overview.epoch_id ?? 1} • {overview.epoch_alias || 'Genesis Epoch'}
               </span>
             </div>
             <div
@@ -218,6 +234,14 @@ export const PortfolioHomeView: React.FC<PortfolioHomeViewProps> = ({
           </div>
         </div>
       </section>
+
+      {/* 1B. Continuous Algo Performance Chart (E.1 All-Epochs TWR % vs Single-Epoch $) */}
+      <ContinuousEquityChart
+        points={equityHistory}
+        epochs={epochs}
+        activeEpochId={overview.epoch_id ?? 1}
+        loading={loading}
+      />
 
       {/* 2. Seam Audit Log Quick-Access Bar (F02 Section 2.2) */}
       <button

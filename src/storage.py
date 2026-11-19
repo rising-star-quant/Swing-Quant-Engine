@@ -52,6 +52,7 @@ DEFAULT_ADMIN_USER_ID = UUID("00000000-0000-4000-8000-000000000001")
 DEFAULT_ADMIN_PORTFOLIO_ID = UUID("00000000-0000-4000-8000-000000000101")
 
 REQUIRED_OHLCV_COLUMNS: tuple[str, ...] = ("Open", "High", "Low", "Close", "Volume")
+GCS_NO_CACHE_CONTROL: str = "no-cache, no-store, must-revalidate, max-age=0"
 
 
 # =============================================================================
@@ -938,11 +939,12 @@ class StatelessGCSStateReader:
                     bucket = client.bucket(self.bucket_name)
                     clean_obj = object_name.strip("/")
                     staging_blob = bucket.blob(f"{clean_obj}.tmp")
-                    staging_blob.cache_control = "no-store"
+                    staging_blob.cache_control = GCS_NO_CACHE_CONTROL
                     staging_blob.upload_from_string(serialized, content_type="application/json")
-                    target_blob = bucket.blob(clean_obj)
-                    target_blob.cache_control = "no-store"
-                    bucket.copy_blob(staging_blob, bucket, clean_obj)
+                    copied_blob = bucket.copy_blob(staging_blob, bucket, clean_obj)
+                    if copied_blob is not None:
+                        copied_blob.cache_control = GCS_NO_CACHE_CONTROL
+                        copied_blob.patch()
                     try:
                         staging_blob.delete()
                     except Exception as cleanup_exc:
@@ -956,6 +958,35 @@ class StatelessGCSStateReader:
             JsonPortfolioStateRepository._write_text_atomically(target_local, serialized)
             self._cache.pop(object_name, None)
             return backend_used
+
+    def backup_objects_in_gcs(
+        self,
+        backup_prefix: str,
+        object_names: Sequence[str],
+    ) -> List[str]:
+        """
+        Copies existing GCS state artifacts into an isolated pre-reset snapshot
+        directory (`backups/pre_reset_epoch_{old_id}_{timestamp}/`).
+        """
+        copied_keys: List[str] = []
+        client = self._get_gcs_client()
+        if client is None or not self.bucket_name:
+            return copied_keys
+
+        bucket = client.bucket(self.bucket_name)
+        clean_prefix = backup_prefix.strip("/")
+        for obj_name in object_names:
+            src_key = obj_name.strip("/")
+            src_blob = bucket.blob(src_key)
+            if not src_blob.exists():
+                continue
+            dest_key = f"{clean_prefix}/{src_key}"
+            copied = bucket.copy_blob(src_blob, bucket, dest_key)
+            if copied is not None:
+                copied.cache_control = GCS_NO_CACHE_CONTROL
+                copied.patch()
+            copied_keys.append(dest_key)
+        return copied_keys
 
     def read_virtual_portfolio(self) -> Tuple[MultiTenantStateStoreSchema, Literal["GCS", "LOCAL_FALLBACK"]]:
         """
@@ -1040,6 +1071,77 @@ class StatelessGCSStateReader:
         if not isinstance(heartbeat_obj, dict):
             raise MalformedStateError("eod_heartbeat.json root must be a JSON object.")
         return heartbeat_obj, hb_backend
+
+    def read_portfolio_epochs(self) -> Tuple[Dict[str, Any], Literal["GCS", "LOCAL_FALLBACK"]]:
+        """
+        Loads E.1 `state/portfolio_epochs.json` (with root fallback `portfolio_epochs.json`).
+        Returns a clean Genesis Epoch #1 container if no reset has occurred yet.
+        """
+        default_epochs: Dict[str, Any] = {
+            "active_epoch_id": 1,
+            "active_epoch_alias": "Genesis Epoch",
+            "state_revision_id": "epoch_1_genesis",
+            "epochs": [
+                {
+                    "epoch_id": 1,
+                    "epoch_alias": "Genesis Epoch",
+                    "reset_timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "closing_equity_before_reset": None,
+                    "starting_equity": 100_000.0,
+                    "positions_liquidated_count": 0,
+                    "triggered_by": "GENESIS",
+                    "closed_at_utc": None,
+                    "epoch_return_pct": None,
+                }
+            ],
+        }
+        raw_obj, backend = self.read_json("state/portfolio_epochs.json", default={})
+        if isinstance(raw_obj, dict) and raw_obj.get("epochs"):
+            return raw_obj, backend
+        root_obj, root_backend = self.read_json("portfolio_epochs.json", default={})
+        if isinstance(root_obj, dict) and root_obj.get("epochs"):
+            return root_obj, root_backend
+        return default_epochs, backend
+
+    def read_equity_history(self) -> Tuple[List[Dict[str, Any]], Literal["GCS", "LOCAL_FALLBACK"]]:
+        """
+        Loads E.1 continuous TWR `state/equity_history.json` (falling back to
+        `equity_history.json` or `state/equity_curve.json`).
+        """
+        raw_obj, backend = self.read_json("state/equity_history.json", default=[])
+        if isinstance(raw_obj, dict) and isinstance(raw_obj.get("points"), list):
+            if raw_obj["points"]:
+                return list(raw_obj["points"]), backend
+        elif isinstance(raw_obj, list) and raw_obj:
+            return list(raw_obj), backend
+
+        root_obj, root_backend = self.read_json("equity_history.json", default=[])
+        if isinstance(root_obj, dict) and isinstance(root_obj.get("points"), list) and root_obj["points"]:
+            return list(root_obj["points"]), root_backend
+        if isinstance(root_obj, list) and root_obj:
+            return list(root_obj), root_backend
+
+        curve_points, curve_backend = self.read_equity_curve()
+        return curve_points, curve_backend
+
+    def read_state_revision(self) -> Tuple[int, str, str]:
+        """
+        Resolves the active `(epoch_id, epoch_alias, state_revision_id)` metadata
+        for Layer 2 Cloud Run response headers (`X-SIRIX-Epoch-ID` and `X-SIRIX-State-Rev`).
+        """
+        state_meta, _ = self.read_json("state/state.json", default={})
+        if isinstance(state_meta, dict) and state_meta.get("state_revision_id"):
+            return (
+                int(state_meta.get("epoch_id", 1)),
+                str(state_meta.get("epoch_alias", "Genesis Epoch")),
+                str(state_meta.get("state_revision_id", "epoch_1_genesis")),
+            )
+        epochs_doc, _ = self.read_portfolio_epochs()
+        return (
+            int(epochs_doc.get("active_epoch_id", 1)),
+            str(epochs_doc.get("active_epoch_alias", "Genesis Epoch")),
+            str(epochs_doc.get("state_revision_id", "epoch_1_genesis")),
+        )
 
 
 # Backward-compatible aliases used across existing modules

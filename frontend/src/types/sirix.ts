@@ -15,7 +15,8 @@ export type ExitReasonCode =
   | 'CHANDELIER_STOP_HIT'
   | 'TIME_BARRIER_EXPIRED'
   | 'EARNINGS_BLACKOUT_EXIT'
-  | 'KILL_SWITCH_LIQUIDATION';
+  | 'KILL_SWITCH_LIQUIDATION'
+  | 'EPOCH_RESET_LIQUIDATION';
 
 export type RejectionStageCode =
   | 'STAGE_1_LIQUIDITY'
@@ -71,6 +72,9 @@ export interface PortfolioOverviewResponse {
   as_of_timestamp: string;
   account_tier: AccountTier;
   system_state: SystemState;
+  epoch_id?: number;
+  epoch_alias?: string;
+  state_revision_id?: string;
   total_equity: number;
   cash_balance: number;
   invested_capital: number;
@@ -85,6 +89,57 @@ export interface PortfolioOverviewResponse {
   is_truncated_for_tier: boolean;
   defensive_mode_context: DefensiveModeContext | null;
   holdings: HoldingSummaryCard[];
+}
+
+/* ==========================================================================
+   2A. E.1 Portfolio Epochs & Continuous TWR Equity History Contracts
+   ========================================================================== */
+
+export interface EpochMarker {
+  epoch_id: number;
+  alias: string;
+}
+
+export interface PortfolioEpochRecord {
+  epoch_id: number;
+  epoch_alias: string;
+  reset_timestamp_utc: string;
+  closing_equity_before_reset: number | null;
+  starting_equity: number;
+  positions_liquidated_count: number;
+  triggered_by: 'GENESIS' | 'GITHUB_ACTIONS_MANUAL' | 'PWA_AUTHORIZED_USER' | string;
+  closed_at_utc?: string | null;
+  epoch_return_pct?: number | null;
+}
+
+export interface PortfolioEpochsResponse {
+  active_epoch_id: number;
+  active_epoch_alias: string;
+  state_revision_id: string;
+  epochs: PortfolioEpochRecord[];
+}
+
+export interface EquityHistoryPoint {
+  date: string;
+  raw_portfolio_value: number;
+  cumulative_algo_return_pct: number;
+  epoch_id: number;
+  epoch_marker: EpochMarker | null;
+}
+
+export interface EquityHistoryResponse {
+  active_epoch_id: number;
+  active_epoch_alias: string;
+  state_revision_id: string;
+  points: EquityHistoryPoint[];
+}
+
+export interface EpochChangeEvent {
+  previousEpochId: number | null;
+  newEpochId: number;
+  newEpochAlias: string;
+  previousStateRev: string | null;
+  newStateRev: string;
 }
 
 /* ==========================================================================

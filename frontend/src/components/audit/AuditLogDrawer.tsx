@@ -41,6 +41,11 @@ function getExitReasonBadgeStyle(reason: ExitReasonCode): {
         bg: 'var(--semantic-crimson-subtle)',
         color: 'var(--semantic-crimson)',
       };
+    case 'EPOCH_RESET_LIQUIDATION':
+      return {
+        bg: 'var(--accent-brand-subtle)',
+        color: 'var(--accent-brand)',
+      };
   }
 }
 

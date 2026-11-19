@@ -71,6 +71,8 @@ class TelegramHTMLFormatter:
             return "🛑 <b>TRAILING STOP BARRIER</b>"
         if reason == ExitReason.VERTICAL_BARRIER_TIME:
             return "⏱️ <b>14-DAY TIME BARRIER</b>"
+        if reason == ExitReason.EPOCH_RESET_LIQUIDATION:
+            return "🔄 <b>EPOCH RESET LIQUIDATION</b>"
         return "⚠️ <b>CIRCUIT BREAKER EXIT</b>"
 
     @classmethod
@@ -193,6 +195,60 @@ class TelegramHTMLFormatter:
             f"<i>Zero-Override Protection: Portfolio state was left untouched.</i>"
         )
 
+    @classmethod
+    def format_epoch_reset_summary(
+        cls,
+        closed_epoch_id: int,
+        closed_epoch_alias: str,
+        closing_equity_before_reset: float,
+        closed_epoch_return_pct: float,
+        new_epoch_id: int,
+        new_epoch_alias: str,
+        starting_equity: float,
+        cumulative_algo_return_pct: float,
+        liquidated_trades: List[ClosedTradeAuditSchema],
+        state_revision_id: str,
+        reset_timestamp_utc: str,
+        triggered_by: str = "GITHUB_ACTIONS_MANUAL",
+    ) -> str:
+        """
+        Formats the structured E.1 Section 3.2(6) Telegram Epoch Reset Summary Card.
+        """
+        ret_sign = "+" if closed_epoch_return_pct >= 0 else ""
+        twr_sign = "+" if cumulative_algo_return_pct >= 0 else ""
+        lines: List[str] = [
+            "🔄 <b>SIRIX PORTFOLIO EPOCH RESET COMPLETED</b>",
+            "━━━━━━━━━━━━━━━━━━",
+            f"📦 <b>Closed Epoch:</b> <code>#{closed_epoch_id}</code> — {html.escape(closed_epoch_alias)}",
+            f"• <b>Closing Equity:</b> <code>${closing_equity_before_reset:,.2f}</code>",
+            f"• <b>Epoch Final Return:</b> <code>{ret_sign}{closed_epoch_return_pct:.2f}%</code>",
+            f"• <b>Positions Liquidated:</b> <code>{len(liquidated_trades)}</code>",
+            "━━━━━━━━━━━━━━━━━━",
+            f"🚀 <b>New Active Epoch:</b> <code>#{new_epoch_id}</code> — {html.escape(new_epoch_alias)}",
+            f"• <b>Starting Capital:</b> <code>${starting_equity:,.2f}</code> (100% Cash)",
+            "• <b>Portfolio Heat:</b> <code>0.00%</code>",
+            "• <b>Kill-Switch Status:</b> <code>ARMED_READY</code>",
+            f"• <b>Continuous Algo TWR:</b> <code>{twr_sign}{cumulative_algo_return_pct:.2f}%</code> (Unbroken)",
+            f"• <b>State Revision:</b> <code>{html.escape(state_revision_id)}</code>",
+            f"• <b>Triggered By:</b> <code>{html.escape(triggered_by)}</code>",
+            f"• <b>Timestamp (UTC):</b> <code>{html.escape(reset_timestamp_utc)}</code>",
+        ]
+
+        if liquidated_trades:
+            lines.append("━━━━━━━━━━━━━━━━━━")
+            lines.append("🧾 <b>FORCE-LIQUIDATED POSITIONS (EPOCH_RESET_LIQUIDATION)</b>")
+            for trade in liquidated_trades:
+                pnl_sign = "+" if trade.realized_pnl_dollars >= 0 else ""
+                lines.append(
+                    f"• <b>{html.escape(trade.ticker)}</b> [{html.escape(trade.index_id)}] — "
+                    f"<code>{trade.shares} sh</code> @ <code>${trade.exit_price:,.2f}</code> "
+                    f"(<code>{pnl_sign}${trade.realized_pnl_dollars:,.2f}</code>)"
+                )
+
+        lines.append("━━━━━━━━━━━━━━━━━━")
+        lines.append("<i>4-Layer Cache Invalidation propagated across GCS, Cloud Run, SW &amp; PWA.</i>")
+        return "\n".join(lines)
+
     @staticmethod
     def chunk_html_message(html_text: str, max_length: int = 4000) -> List[str]:
         if len(html_text) <= max_length:
@@ -240,6 +296,7 @@ class TelegramNotifier:
         self.base_backoff_sec = base_backoff_sec
         self.request_timeout_sec = request_timeout_sec
         self.formatter = TelegramHTMLFormatter()
+        self._dispatched_idempotency_keys: set[str] = set()
 
     @property
     def is_configured(self) -> bool:
@@ -346,6 +403,60 @@ class TelegramNotifier:
         )
         return self._send_html_payload(chat_id=target_chat_id, text=alert_html)
 
+    def dispatch_epoch_reset_summary(
+        self,
+        closed_epoch_id: int,
+        closed_epoch_alias: str,
+        closing_equity_before_reset: float,
+        closed_epoch_return_pct: float,
+        new_epoch_id: int,
+        new_epoch_alias: str,
+        starting_equity: float,
+        cumulative_algo_return_pct: float,
+        liquidated_trades: List[ClosedTradeAuditSchema],
+        state_revision_id: str,
+        reset_timestamp_utc: str,
+        triggered_by: str = "GITHUB_ACTIONS_MANUAL",
+        idempotency_key: Optional[str] = None,
+    ) -> bool:
+        """
+        Dispatches the E.1 Epoch Reset Summary Card via Telegram with idempotency protection.
+        """
+        dedup_key = idempotency_key or f"epoch_reset:{state_revision_id}"
+        if dedup_key in self._dispatched_idempotency_keys:
+            logger.info("Skipping duplicate Epoch Reset alert for idempotency key=%s", dedup_key)
+            return True
+
+        if not self.is_configured:
+            logger.info("Telegram credentials not configured; skipping Epoch Reset Telegram card.")
+            return False
+
+        target_chat_id = _unwrap_secret(getattr(self.settings, "telegram_chat_id", None))
+        card_html = TelegramHTMLFormatter.format_epoch_reset_summary(
+            closed_epoch_id=closed_epoch_id,
+            closed_epoch_alias=closed_epoch_alias,
+            closing_equity_before_reset=closing_equity_before_reset,
+            closed_epoch_return_pct=closed_epoch_return_pct,
+            new_epoch_id=new_epoch_id,
+            new_epoch_alias=new_epoch_alias,
+            starting_equity=starting_equity,
+            cumulative_algo_return_pct=cumulative_algo_return_pct,
+            liquidated_trades=liquidated_trades,
+            state_revision_id=state_revision_id,
+            reset_timestamp_utc=reset_timestamp_utc,
+            triggered_by=triggered_by,
+        )
+        chunks = TelegramHTMLFormatter.chunk_html_message(
+            card_html, max_length=self.MAX_MESSAGE_LENGTH
+        )
+        all_ok = True
+        for chunk in chunks:
+            if not self._send_html_payload(chat_id=target_chat_id, text=chunk):
+                all_ok = False
+        if all_ok:
+            self._dispatched_idempotency_keys.add(dedup_key)
+        return all_ok
+
     def _send_html_payload(self, chat_id: str, text: str) -> bool:
         token = _unwrap_secret(getattr(self.settings, "telegram_bot_token", None))
         if not token or not chat_id:
@@ -395,3 +506,4 @@ class TelegramNotifier:
 
 
 TelegramDispatchService = TelegramNotifier
+NotificationHub = TelegramNotifier

@@ -38,6 +38,7 @@ logger = logging.getLogger("SIRIX.CloudExporter")
 
 PRIMARY_SIRIX_USER_ID: str = "usr_sirix_primary"
 CANONICAL_GCS_BUCKET: str = "sirix-quant-state-prod"
+GCS_NO_CACHE_CONTROL: str = "no-cache, no-store, must-revalidate, max-age=0"
 
 TimelinePhase = Literal["FRESH", "MATURING", "CRITICAL"]
 AuditExitReasonLiteral = Literal[
@@ -46,6 +47,7 @@ AuditExitReasonLiteral = Literal[
     "TIME_BARRIER",
     "EARNINGS_BLACKOUT",
     "KILL_SWITCH",
+    "EPOCH_RESET_LIQUIDATION",
 ]
 LanguageLiteral = Literal["en", "he", "ar", "ru"]
 ThemeLiteral = Literal["obsidian-dark", "sirius-ice-light", "midnight-sapphire"]
@@ -88,6 +90,7 @@ def map_exit_reason_to_sirix(reason: ExitReason | str) -> AuditExitReasonLiteral
         "EARNINGS_BLACKOUT": "EARNINGS_BLACKOUT",
         "SYSTEM_CIRCUIT_BREAKER": "KILL_SWITCH",
         "KILL_SWITCH": "KILL_SWITCH",
+        "EPOCH_RESET_LIQUIDATION": "EPOCH_RESET_LIQUIDATION",
     }
     return mapping.get(raw, "CHANDELIER_STOP")
 
@@ -260,16 +263,71 @@ class StateStorageAdapter:
             blob_key = self._object_key(user_id, filename)
             try:
                 blob = bucket.blob(blob_key)
-                blob.cache_control = "no-store"
+                blob.cache_control = GCS_NO_CACHE_CONTROL
                 blob.upload_from_string(
                     json.dumps(payload, indent=2, ensure_ascii=False),
                     content_type="application/json",
                 )
-                logger.info(f"Uploaded gs://{self.bucket_name}/{blob_key}")
+                blob.cache_control = GCS_NO_CACHE_CONTROL
+                blob.patch()
+                logger.info(f"Uploaded gs://{self.bucket_name}/{blob_key} (Cache-Control: {GCS_NO_CACHE_CONTROL})")
             except Exception as exc:
                 logger.warning(
                     f"GCS upload warning for gs://{self.bucket_name}/{blob_key} (local copy saved): {exc}"
                 )
+
+    def write_root_json(self, object_name: str, payload: Any) -> None:
+        """
+        Writes a canonical root/state JSON document atomically to local `data/{object_name}`
+        and uploads to GCS with E.1 Layer 1 `no-cache, no-store, must-revalidate, max-age=0`.
+        """
+        clean_key = object_name.strip("/")
+        local_target = (self.local_data_dir / clean_key).resolve()
+        self._write_json_atomically(local_target, payload)
+
+        bucket = self._get_gcs_bucket()
+        if bucket is not None:
+            try:
+                blob = bucket.blob(clean_key)
+                blob.cache_control = GCS_NO_CACHE_CONTROL
+                blob.upload_from_string(
+                    json.dumps(payload, indent=2, ensure_ascii=False),
+                    content_type="application/json",
+                )
+                blob.cache_control = GCS_NO_CACHE_CONTROL
+                blob.patch()
+                logger.info(f"Uploaded gs://{self.bucket_name}/{clean_key}")
+            except Exception as exc:
+                logger.warning(
+                    f"GCS root upload warning for gs://{self.bucket_name}/{clean_key} (local copy saved): {exc}"
+                )
+
+    def read_root_json(self, object_name: str) -> Optional[Any]:
+        """
+        Reads a canonical root/state JSON document from GCS (preferred) or local `data/`.
+        """
+        clean_key = object_name.strip("/")
+        basename = Path(clean_key).name
+        bucket = self._get_gcs_bucket()
+        if bucket is not None:
+            for candidate_key in dict.fromkeys([clean_key, basename]):
+                try:
+                    blob = bucket.blob(candidate_key)
+                    if blob.exists():
+                        return json.loads(blob.download_as_bytes().decode("utf-8"))
+                except Exception as exc:
+                    logger.debug(f"GCS root read fallback for {candidate_key}: {exc}")
+
+        for local_candidate in dict.fromkeys(
+            [
+                self.local_data_dir / clean_key,
+                self.local_data_dir / "state" / basename,
+                self.local_data_dir / basename,
+            ]
+        ):
+            if local_candidate.exists() and local_candidate.is_file():
+                return json.loads(local_candidate.read_text(encoding="utf-8"))
+        return None
 
     def read_user_json(self, user_id: str, filename: str) -> Optional[Any]:
         """
@@ -603,10 +661,23 @@ class SirixCloudExporter:
         prev_equity = max(1.0, total_equity - daily_change_amount)
         daily_change_pct = round((daily_change_amount / prev_equity) * 100.0, 2)
 
+        state_meta = self.storage.read_root_json("state/state.json") or {}
+        active_epoch_id = int(state_meta.get("epoch_id", 1))
+        active_epoch_alias = str(state_meta.get("epoch_alias", "Genesis Epoch"))
+        state_revision_id = str(
+            state_meta.get(
+                "state_revision_id",
+                f"epoch_{active_epoch_id}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+            )
+        )
+
         portfolio_state_payload: Dict[str, Any] = {
             "as_of_eod": eod_iso,
             "market_status": "CLOSED",
             "defensive_cash_mode": len(holdings_list) == 0,
+            "epoch_id": active_epoch_id,
+            "epoch_alias": active_epoch_alias,
+            "state_revision_id": state_revision_id,
             "summary": {
                 "total_equity": total_equity,
                 "daily_change_amount": daily_change_amount,

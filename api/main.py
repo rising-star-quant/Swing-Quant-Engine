@@ -132,10 +132,52 @@ class PortfolioOverviewResponseContract(BaseModel):
     as_of_eod: str
     market_status: Literal["OPEN", "CLOSED"] = "CLOSED"
     defensive_cash_mode: bool
+    epoch_id: int = 1
+    epoch_alias: str = "Genesis Epoch"
+    state_revision_id: str = "epoch_1_genesis"
     summary: PortfolioSummaryContract
     audit_badge: AuditBadgeContract
     holdings: List[HoldingItemContract]
     truncated_count: int = 0
+
+
+class EpochMarkerContract(BaseModel):
+    epoch_id: int
+    alias: str
+
+
+class PortfolioEpochRecordContract(BaseModel):
+    epoch_id: int
+    epoch_alias: str
+    reset_timestamp_utc: str
+    closing_equity_before_reset: Optional[float] = None
+    starting_equity: float = 100000.0
+    positions_liquidated_count: int = 0
+    triggered_by: str = "GENESIS"
+    closed_at_utc: Optional[str] = None
+    epoch_return_pct: Optional[float] = None
+
+
+class PortfolioEpochsResponseContract(BaseModel):
+    active_epoch_id: int
+    active_epoch_alias: str
+    state_revision_id: str
+    epochs: List[PortfolioEpochRecordContract]
+
+
+class EquityHistoryPointContract(BaseModel):
+    date: str
+    raw_portfolio_value: float
+    cumulative_algo_return_pct: float
+    epoch_id: int
+    epoch_marker: Optional[EpochMarkerContract] = None
+
+
+class EquityHistoryResponseContract(BaseModel):
+    active_epoch_id: int
+    active_epoch_alias: str
+    state_revision_id: str
+    points: List[EquityHistoryPointContract]
 
 
 class PositionBarriersContract(BaseModel):
@@ -214,6 +256,7 @@ class AuditLogItemContract(BaseModel):
         "TIME_BARRIER",
         "EARNINGS_BLACKOUT",
         "KILL_SWITCH",
+        "EPOCH_RESET_LIQUIDATION",
     ]
     conviction_at_entry: Optional[float] = None
 
@@ -770,7 +813,46 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept"],
+    expose_headers=["X-SIRIX-Epoch-ID", "X-SIRIX-State-Rev", "Cache-Control"],
 )
+
+
+def _resolve_epoch_headers(storage: StateStorageAdapter) -> Dict[str, str]:
+    state_meta = storage.read_root_json("state/state.json")
+    if isinstance(state_meta, dict) and state_meta.get("state_revision_id"):
+        return {
+            "X-SIRIX-Epoch-ID": str(int(state_meta.get("epoch_id", 1))),
+            "X-SIRIX-State-Rev": str(state_meta["state_revision_id"]),
+        }
+    epochs_doc = storage.read_root_json("state/portfolio_epochs.json")
+    if isinstance(epochs_doc, dict) and epochs_doc.get("state_revision_id"):
+        return {
+            "X-SIRIX-Epoch-ID": str(int(epochs_doc.get("active_epoch_id", 1))),
+            "X-SIRIX-State-Rev": str(epochs_doc["state_revision_id"]),
+        }
+    return {
+        "X-SIRIX-Epoch-ID": "1",
+        "X-SIRIX-State-Rev": "epoch_1_genesis",
+    }
+
+
+@app.middleware("http")
+async def inject_layer2_cache_invalidation_headers(request: Request, call_next: Any) -> Response:
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        try:
+            storage_adapter = get_storage_adapter()
+            epoch_headers = _resolve_epoch_headers(storage_adapter)
+            response.headers["X-SIRIX-Epoch-ID"] = epoch_headers["X-SIRIX-Epoch-ID"]
+            response.headers["X-SIRIX-State-Rev"] = epoch_headers["X-SIRIX-State-Rev"]
+        except Exception as err:
+            logger.debug(f"Epoch header fallback applied: {err}")
+            response.headers.setdefault("X-SIRIX-Epoch-ID", "1")
+            response.headers.setdefault("X-SIRIX-State-Rev", "epoch_1_genesis")
+    return response
+
 
 session_manager = SirixSessionManager()
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -1025,14 +1107,127 @@ async def get_portfolio_overview(
         visible_holdings = computed_holdings
         truncated_count = 0
 
+    state_meta = storage.read_root_json("state/state.json") or {}
+    active_epoch_id = int(raw_state.get("epoch_id") or state_meta.get("epoch_id") or 1)
+    active_epoch_alias = str(
+        raw_state.get("epoch_alias") or state_meta.get("epoch_alias") or "Genesis Epoch"
+    )
+    active_revision_id = str(
+        raw_state.get("state_revision_id")
+        or state_meta.get("state_revision_id")
+        or f"epoch_{active_epoch_id}_genesis"
+    )
+
     return PortfolioOverviewResponseContract(
         as_of_eod=str(raw_state.get("as_of_eod", "2026-11-17T21:00:00Z")),
         market_status=raw_state.get("market_status", "CLOSED"),
         defensive_cash_mode=defensive_cash_mode,
+        epoch_id=active_epoch_id,
+        epoch_alias=active_epoch_alias,
+        state_revision_id=active_revision_id,
         summary=PortfolioSummaryContract.model_validate(raw_state["summary"]),
         audit_badge=AuditBadgeContract.model_validate(raw_state["audit_badge"]),
         holdings=visible_holdings,
         truncated_count=truncated_count,
+    )
+
+
+@app.get("/api/v1/portfolio/epochs", response_model=PortfolioEpochsResponseContract)
+async def get_portfolio_epochs(
+    _current_user: CurrentUserClaims = Depends(get_current_user),
+    storage: StateStorageAdapter = Depends(get_storage_adapter),
+) -> PortfolioEpochsResponseContract:
+    raw_epochs = storage.read_root_json("state/portfolio_epochs.json")
+    if isinstance(raw_epochs, dict) and raw_epochs.get("epochs"):
+        return PortfolioEpochsResponseContract.model_validate(raw_epochs)
+
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return PortfolioEpochsResponseContract(
+        active_epoch_id=1,
+        active_epoch_alias="Genesis Epoch",
+        state_revision_id="epoch_1_genesis",
+        epochs=[
+            PortfolioEpochRecordContract(
+                epoch_id=1,
+                epoch_alias="Genesis Epoch",
+                reset_timestamp_utc=now_iso,
+                closing_equity_before_reset=None,
+                starting_equity=100000.0,
+                positions_liquidated_count=0,
+                triggered_by="GENESIS",
+                closed_at_utc=None,
+                epoch_return_pct=0.0,
+            )
+        ],
+    )
+
+
+@app.get("/api/v1/portfolio/equity-history", response_model=EquityHistoryResponseContract)
+async def get_portfolio_equity_history(
+    _current_user: CurrentUserClaims = Depends(get_current_user),
+    storage: StateStorageAdapter = Depends(get_storage_adapter),
+) -> EquityHistoryResponseContract:
+    epochs_doc = storage.read_root_json("state/portfolio_epochs.json") or {}
+    active_epoch_id = int(epochs_doc.get("active_epoch_id", 1))
+    active_epoch_alias = str(epochs_doc.get("active_epoch_alias", "Genesis Epoch"))
+    state_revision_id = str(epochs_doc.get("state_revision_id", "epoch_1_genesis"))
+
+    raw_history = storage.read_root_json("state/equity_history.json")
+    if raw_history is None:
+        raw_history = storage.read_root_json("state/equity_curve.json")
+
+    raw_points: List[Dict[str, Any]] = []
+    if isinstance(raw_history, list):
+        raw_points = raw_history
+    elif isinstance(raw_history, dict) and isinstance(raw_history.get("points"), list):
+        raw_points = raw_history["points"]
+
+    normalized_points: List[EquityHistoryPointContract] = []
+    for pt in raw_points:
+        if not isinstance(pt, dict) or not pt.get("date"):
+            continue
+        raw_val = float(pt.get("raw_portfolio_value") or pt.get("portfolio_nav") or 100000.0)
+        cum_ret = float(
+            pt.get(
+                "cumulative_algo_return_pct",
+                round(((raw_val - 100000.0) / 100000.0) * 100.0, 4),
+            )
+        )
+        marker_raw = pt.get("epoch_marker")
+        marker = (
+            EpochMarkerContract(
+                epoch_id=int(marker_raw["epoch_id"]),
+                alias=str(marker_raw["alias"]),
+            )
+            if isinstance(marker_raw, dict) and marker_raw.get("epoch_id") and marker_raw.get("alias")
+            else None
+        )
+        normalized_points.append(
+            EquityHistoryPointContract(
+                date=str(pt["date"]),
+                raw_portfolio_value=round(raw_val, 2),
+                cumulative_algo_return_pct=round(cum_ret, 4),
+                epoch_id=int(pt.get("epoch_id", active_epoch_id)),
+                epoch_marker=marker,
+            )
+        )
+
+    if not normalized_points:
+        normalized_points.append(
+            EquityHistoryPointContract(
+                date=datetime.now(timezone.utc).date().isoformat(),
+                raw_portfolio_value=100000.0,
+                cumulative_algo_return_pct=0.0,
+                epoch_id=active_epoch_id,
+                epoch_marker=None,
+            )
+        )
+
+    return EquityHistoryResponseContract(
+        active_epoch_id=active_epoch_id,
+        active_epoch_alias=active_epoch_alias,
+        state_revision_id=state_revision_id,
+        points=normalized_points,
     )
 
 
