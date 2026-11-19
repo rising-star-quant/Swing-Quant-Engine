@@ -81,6 +81,8 @@ jobs:
         env:
           PYTHONPATH: .
           ENVIRONMENT: production
+          DRY_RUN: 'false'
+          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
           SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
           GCS_BUCKET_NAME: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
