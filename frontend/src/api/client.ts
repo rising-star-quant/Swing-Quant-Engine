@@ -949,6 +949,67 @@ export class SirixApiClient {
     return payload;
   }
 
+  private decodeJwtClaims(token: string): Record<string, unknown> | null {
+    try {
+      const parts = token.split('.');
+      if (parts.length < 2) return null;
+      const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=');
+      return JSON.parse(atob(padded)) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  public async restoreSession(): Promise<AuthTokenResponse | null> {
+    try {
+      const refreshRes = await fetch(`${API_BASE_URL}/api/v1/auth/refresh`, {
+        method: 'POST',
+        cache: 'no-store',
+        credentials: 'include',
+      });
+      if (!refreshRes.ok) {
+        return null;
+      }
+      const raw = (await refreshRes.json()) as Record<string, unknown>;
+      const token = String(raw.access_token || '');
+      const claims = this.decodeJwtClaims(token);
+      const tierFromClaims = String(claims?.tier || 'PRO').toUpperCase() as AccountTier;
+      const resolvedTier: AccountTier =
+        tierFromClaims === 'FREE' || tierFromClaims === 'PRO' || tierFromClaims === 'EXPERT'
+          ? tierFromClaims
+          : 'PRO';
+      const normalized = this.normalizeAuthPayload(
+        {
+          ...raw,
+          user_id: claims?.sub || raw.user_id || 'usr_sirix_primary',
+          account_tier: resolvedTier,
+        },
+        resolvedTier
+      );
+      this.isUsingFallback = false;
+      return normalized;
+    } catch {
+      return null;
+    }
+  }
+
+  public async logout(): Promise<void> {
+    try {
+      await fetch(`${API_BASE_URL}/api/v1/auth/logout`, {
+        method: 'POST',
+        cache: 'no-store',
+        credentials: 'include',
+      });
+    } catch {
+      // Ignore network errors during logout
+    } finally {
+      this.accessToken = null;
+      this.isUsingFallback = false;
+      this.clearLocalCache();
+    }
+  }
+
   /* ------------------------------------------------------------------------
      1. Authentication (/api/v1/auth/login)
      ------------------------------------------------------------------------ */
@@ -962,8 +1023,13 @@ export class SirixApiClient {
         method: 'POST',
         body: JSON.stringify({ email, password }),
       });
+      this.clearLocalCache();
       return this.normalizeAuthPayload(raw, preferredTier);
-    } catch {
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '';
+      if (message === 'HTTP_401' || message === 'HTTP_403' || message === 'HTTP_422') {
+        throw new Error('Invalid email or password. Use trader@sirix.quant, pro@sirix.quant, or free@sirix.quant.');
+      }
       this.isUsingFallback = true;
       const resolvedTier: AccountTier = email.toLowerCase().includes('free')
         ? 'FREE'
@@ -1034,11 +1100,11 @@ export class SirixApiClient {
         });
 
         const truncatedCount = Number(raw.truncated_count ?? 0);
+        const visibleHoldings = this.simulateDefensiveCash ? [] : mappedHoldings;
         const isDefensive =
           Boolean(raw.defensive_cash_mode) ||
-          mappedHoldings.length === 0 ||
-          this.simulateDefensiveCash ||
-          killSwitchActive;
+          visibleHoldings.length === 0 ||
+          this.simulateDefensiveCash;
 
         const normalized: PortfolioOverviewResponse = {
           as_of_timestamp: String(raw.as_of_eod || raw.as_of_timestamp || new Date().toISOString()),
@@ -1060,8 +1126,8 @@ export class SirixApiClient {
           inception_return_pct: Number(summary.inception_change_pct ?? 0),
           portfolio_heat_pct: Number(summary.portfolio_heat_pct ?? 0),
           max_portfolio_heat_pct: Number(summary.max_portfolio_heat_pct ?? 6.0),
-          active_positions_count: mappedHoldings.length + truncatedCount,
-          visible_positions_count: mappedHoldings.length,
+          active_positions_count: visibleHoldings.length + truncatedCount,
+          visible_positions_count: visibleHoldings.length,
           is_truncated_for_tier: truncatedCount > 0,
           defensive_mode_context: isDefensive
             ? {
@@ -1077,7 +1143,7 @@ export class SirixApiClient {
                 capital_preserved_pct: 100.0,
               }
             : null,
-          holdings: this.simulateDefensiveCash || killSwitchActive ? [] : mappedHoldings,
+          holdings: visibleHoldings,
         };
 
         saveSnapshotCache(cacheKey, normalized);
@@ -1619,8 +1685,8 @@ export class SirixApiClient {
           earnings_blackout_days: cached?.guardrails?.earnings_blackout_days ?? 5,
           active_universes: cached?.guardrails?.active_universes ?? ['RUT', 'MID'],
           zero_override_enforced: true,
-          // Never sticky-cache a halted kill-switch across unauthenticated sessions
-          kill_switch_active: this.accessToken ? Boolean(cached?.guardrails?.kill_switch_active) : false,
+          // Never resurrect a stale halted kill-switch from localStorage fallback
+          kill_switch_active: false,
         },
       };
       return fallback;

@@ -6,7 +6,7 @@ import os
 from typing import Any, Dict, List, Literal, Optional, Set
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -804,6 +804,8 @@ app = FastAPI(
     description="Stateless Cloud Run Telemetry Bridge for the SIRIX Swing Quant Engine (Zero-Override Enforced).",
 )
 
+v1_router = APIRouter()
+
 cors_origins_raw = os.environ.get("SIRIX_CORS_ORIGINS", "http://localhost:3000,http://localhost:5173")
 cors_origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
 
@@ -963,7 +965,7 @@ def _set_refresh_cookie(response: Response, refresh_token: str) -> None:
     )
 
 
-@app.post("/api/v1/auth/login", response_model=AuthTokenResponseContract)
+@v1_router.post("/api/v1/auth/login", response_model=AuthTokenResponseContract)
 async def auth_login(
     payload: LoginRequestContract,
     response: Response,
@@ -1007,7 +1009,7 @@ async def auth_login(
     )
 
 
-@app.post("/api/v1/auth/refresh", response_model=RefreshTokenResponseContract)
+@v1_router.post("/api/v1/auth/refresh", response_model=RefreshTokenResponseContract)
 async def auth_refresh(
     request: Request,
     response: Response,
@@ -1039,7 +1041,7 @@ async def auth_refresh(
     )
 
 
-@app.post("/api/v1/auth/logout")
+@v1_router.post("/api/v1/auth/logout")
 async def auth_logout(request: Request, response: Response) -> Dict[str, str]:
     refresh_cookie = request.cookies.get(REFRESH_COOKIE_NAME)
     session_manager.revoke_refresh_token(refresh_cookie)
@@ -1058,8 +1060,8 @@ async def auth_logout(request: Request, response: Response) -> Dict[str, str]:
 # =============================================================================
 
 
-@app.get("/api/v1/portfolio", response_model=PortfolioOverviewResponseContract)
-@app.get("/api/v1/portfolio/overview", response_model=PortfolioOverviewResponseContract)
+@v1_router.get("/api/v1/portfolio", response_model=PortfolioOverviewResponseContract)
+@v1_router.get("/api/v1/portfolio/overview", response_model=PortfolioOverviewResponseContract)
 async def get_portfolio_overview(
     current_user: CurrentUserClaims = Depends(get_current_user),
     storage: StateStorageAdapter = Depends(get_storage_adapter),
@@ -1077,6 +1079,46 @@ async def get_portfolio_overview(
             ] = prefs.guardrails.max_portfolio_heat_pct
         except Exception as prefs_err:
             logger.debug(f"Skipped invalid preferences override: {prefs_err}")
+
+    state_meta = storage.read_root_json("state/state.json") or {}
+    if (
+        isinstance(state_meta, dict)
+        and state_meta.get("state_revision_id")
+        and raw_state.get("state_revision_id") != state_meta.get("state_revision_id")
+        and int(state_meta.get("open_positions_count", -1)) == 0
+    ):
+        baseline_equity = float(state_meta.get("total_equity", 100000.0))
+        baseline_cash = float(state_meta.get("cash_balance", baseline_equity))
+        existing_summary = dict(raw_state.get("summary") or {})
+        raw_state = {
+            **raw_state,
+            "as_of_eod": str(
+                state_meta.get("last_updated_utc")
+                or raw_state.get("as_of_eod", "2026-11-17T21:00:00Z")
+            ),
+            "defensive_cash_mode": True,
+            "epoch_id": int(state_meta.get("epoch_id", 1)),
+            "epoch_alias": str(state_meta.get("epoch_alias", "Genesis Epoch")),
+            "state_revision_id": str(state_meta["state_revision_id"]),
+            "summary": {
+                **existing_summary,
+                "total_equity": baseline_equity,
+                "cash_balance": baseline_cash,
+                "invested_value": 0.0,
+                "daily_change_amount": 0.0,
+                "daily_change_pct": 0.0,
+                "inception_change_amount": round(baseline_equity - 100000.0, 2),
+                "inception_change_pct": round(
+                    ((baseline_equity - 100000.0) / 100000.0) * 100.0, 2
+                ),
+                "portfolio_heat_pct": 0.0,
+                "max_portfolio_heat_pct": float(
+                    existing_summary.get("max_portfolio_heat_pct", 6.0)
+                ),
+            },
+            "holdings": [],
+            "truncated_count": 0,
+        }
 
     raw_holdings = list(raw_state.get("holdings", []))
     computed_holdings: List[HoldingItemContract] = []
@@ -1107,7 +1149,6 @@ async def get_portfolio_overview(
         visible_holdings = computed_holdings
         truncated_count = 0
 
-    state_meta = storage.read_root_json("state/state.json") or {}
     active_epoch_id = int(raw_state.get("epoch_id") or state_meta.get("epoch_id") or 1)
     active_epoch_alias = str(
         raw_state.get("epoch_alias") or state_meta.get("epoch_alias") or "Genesis Epoch"
@@ -1132,7 +1173,7 @@ async def get_portfolio_overview(
     )
 
 
-@app.get("/api/v1/portfolio/epochs", response_model=PortfolioEpochsResponseContract)
+@v1_router.get("/api/v1/portfolio/epochs", response_model=PortfolioEpochsResponseContract)
 async def get_portfolio_epochs(
     _current_user: CurrentUserClaims = Depends(get_current_user),
     storage: StateStorageAdapter = Depends(get_storage_adapter),
@@ -1162,7 +1203,7 @@ async def get_portfolio_epochs(
     )
 
 
-@app.get("/api/v1/portfolio/equity-history", response_model=EquityHistoryResponseContract)
+@v1_router.get("/api/v1/portfolio/equity-history", response_model=EquityHistoryResponseContract)
 async def get_portfolio_equity_history(
     _current_user: CurrentUserClaims = Depends(get_current_user),
     storage: StateStorageAdapter = Depends(get_storage_adapter),
@@ -1231,7 +1272,7 @@ async def get_portfolio_equity_history(
     )
 
 
-@app.get("/api/v1/positions/{ticker}", response_model=PositionDeepDiveResponseContract)
+@v1_router.get("/api/v1/positions/{ticker}", response_model=PositionDeepDiveResponseContract)
 async def get_position_deep_dive(
     ticker: str,
     current_user: CurrentUserClaims = Depends(get_current_user),
@@ -1263,7 +1304,7 @@ async def get_position_deep_dive(
     return PositionDeepDiveResponseContract.model_validate(pos_data)
 
 
-@app.get("/api/v1/search/{ticker}", response_model=SearchTickerResponseContract)
+@v1_router.get("/api/v1/search/{ticker}", response_model=SearchTickerResponseContract)
 async def search_ticker_transparency(
     ticker: str,
     current_user: CurrentUserClaims = Depends(get_current_user),
@@ -1306,7 +1347,7 @@ async def search_ticker_transparency(
     return SearchTickerResponseContract.model_validate(rej)
 
 
-@app.get("/api/v1/audit-log", response_model=AuditLogResponseContract)
+@v1_router.get("/api/v1/audit-log", response_model=AuditLogResponseContract)
 async def get_closed_trades_audit_log(
     current_user: CurrentUserClaims = Depends(get_current_user),
     storage: StateStorageAdapter = Depends(get_storage_adapter),
@@ -1328,7 +1369,7 @@ async def get_closed_trades_audit_log(
     )
 
 
-@app.get("/api/v1/preferences", response_model=UserPreferencesContract)
+@v1_router.get("/api/v1/preferences", response_model=UserPreferencesContract)
 async def get_user_preferences(
     current_user: CurrentUserClaims = Depends(get_current_user),
     storage: StateStorageAdapter = Depends(get_storage_adapter),
@@ -1345,7 +1386,7 @@ async def get_user_preferences(
     return UserPreferencesContract.model_validate(raw_prefs)
 
 
-@app.patch("/api/v1/preferences", response_model=UserPreferencesContract)
+@v1_router.patch("/api/v1/preferences", response_model=UserPreferencesContract)
 async def patch_user_preferences(
     patch_body: PatchPreferencesRequestContract,
     current_user: CurrentUserClaims = Depends(get_current_user),
@@ -1399,3 +1440,6 @@ async def patch_user_preferences(
         updated_prefs.model_dump(mode="json"),
     )
     return updated_prefs
+
+
+app.include_router(v1_router)

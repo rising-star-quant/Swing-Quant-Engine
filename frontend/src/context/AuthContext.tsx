@@ -1,10 +1,11 @@
-import React, { createContext, useContext, useState } from 'react';
+import React, { createContext, useContext, useState, useEffect } from 'react';
 import { AccountTier } from '../types/sirix';
 import { sirixClient } from '../api/client';
 import { usePreferences } from './PreferencesContext';
 
 interface AuthContextValue {
   isAuthenticated: boolean;
+  authInitializing: boolean;
   userId: string;
   accountTier: AccountTier;
   simulateDefensiveCash: boolean;
@@ -20,10 +21,35 @@ const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { syncTierWithPreferences, refreshPreferences } = usePreferences();
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(true);
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [authInitializing, setAuthInitializing] = useState<boolean>(true);
   const [userId, setUserId] = useState<string>('usr_sirix_primary');
   const [accountTier, setAccountTier] = useState<AccountTier>('PRO');
   const [simulateDefensiveCash, setSimulateDefensiveCash] = useState<boolean>(false);
+
+  useEffect(() => {
+    let active = true;
+    sirixClient
+      .restoreSession()
+      .then(async (restored) => {
+        if (!active) return;
+        if (restored) {
+          setUserId(restored.user_id);
+          setAccountTier(restored.account_tier);
+          syncTierWithPreferences(restored.account_tier);
+          await refreshPreferences();
+          setIsAuthenticated(true);
+        }
+      })
+      .finally(() => {
+        if (active) {
+          setAuthInitializing(false);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [syncTierWithPreferences, refreshPreferences]);
 
   const login = async (email: string, password: string, tier: AccountTier = 'PRO') => {
     const authRes = await sirixClient.login(email, password, tier);
@@ -54,7 +80,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const logout = () => {
-    sirixClient.setSession(null, 'FREE');
+    void sirixClient.logout();
     setIsAuthenticated(false);
   };
 
@@ -62,6 +88,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     <AuthContext.Provider
       value={{
         isAuthenticated,
+        authInitializing,
         userId,
         accountTier,
         simulateDefensiveCash,

@@ -8,16 +8,20 @@ import { TermTooltip } from '../common/TermTooltip';
 export const LoginScreen: React.FC = () => {
   const { login, enterSandbox } = useAuth();
   const { t, language } = usePreferences();
-  const [email, setEmail] = useState('institutional@sirix-quant.io');
-  const [password, setPassword] = useState('••••••••••••••••');
-  const [selectedTier, setSelectedTier] = useState<AccountTier>('PRO');
+  const [email, setEmail] = useState('trader@sirix.quant');
+  const [password, setPassword] = useState('');
+  const [selectedTier, setSelectedTier] = useState<AccountTier>('EXPERT');
   const [loading, setLoading] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
+    setAuthError(null);
     try {
       await login(email, password, selectedTier);
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Authentication failed.');
     } finally {
       setLoading(false);
     }
@@ -57,7 +61,16 @@ export const LoginScreen: React.FC = () => {
               <button
                 key={tier}
                 type="button"
-                onClick={() => setSelectedTier(tier)}
+                onClick={() => {
+                  setSelectedTier(tier);
+                  setEmail(
+                    tier === 'FREE'
+                      ? 'free@sirix.quant'
+                      : tier === 'PRO'
+                      ? 'pro@sirix.quant'
+                      : 'trader@sirix.quant'
+                  );
+                }}
                 className={`py-2 px-3 rounded-lg text-xs font-mono-tabular font-semibold border transition-all cursor-pointer ${
                   selectedTier === tier
                     ? 'border-[var(--accent-brand)] bg-[var(--accent-brand-subtle)] text-[var(--accent-brand)]'
@@ -71,6 +84,15 @@ export const LoginScreen: React.FC = () => {
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">
+          {authError && (
+            <div
+              role="alert"
+              className="rounded-lg border border-[var(--semantic-crimson)] bg-[var(--semantic-crimson-subtle)] px-3 py-2 text-xs text-[var(--semantic-crimson)]"
+            >
+              {authError}
+            </div>
+          )}
+
           <div>
             <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1.5">
               {t.auth.emailLabel}
@@ -95,6 +117,7 @@ export const LoginScreen: React.FC = () => {
                 required
                 dir="ltr"
                 value={password}
+                placeholder="Enter password"
                 onChange={(e) => setPassword(e.target.value)}
                 className="w-full px-3.5 py-2.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-canvas)] text-sm font-mono-tabular text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent-brand)]"
               />

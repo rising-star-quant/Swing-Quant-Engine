@@ -837,6 +837,25 @@ def create_app(
         )
 
     # -------------------------------------------------------------------------
+    # Mount Unified PWA /api/v1/* Telemetry & Auth Router (Cloud Run Parity)
+    # -------------------------------------------------------------------------
+
+    try:
+        from api.main import (
+            SirixAPIException as _V1SirixAPIException,
+            handle_sirix_api_exception as _v1_handle_sirix_api_exception,
+            v1_router as _v1_router,
+        )
+
+        fastapi_app.add_exception_handler(
+            _V1SirixAPIException,
+            _v1_handle_sirix_api_exception,  # type: ignore[arg-type]
+        )
+        fastapi_app.include_router(_v1_router)
+    except Exception as v1_mount_err:
+        logger.warning(f"Optional /api/v1 router mount skipped: {v1_mount_err}")
+
+    # -------------------------------------------------------------------------
     # Unmatched /api/* Catch-All (Never fall through to SPA index.html)
     # -------------------------------------------------------------------------
 

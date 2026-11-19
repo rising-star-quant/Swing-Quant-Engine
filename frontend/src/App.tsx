@@ -35,6 +35,7 @@ type ActiveWorkspaceTab = 'portfolio' | 'search' | 'preferences';
 const SirixTerminalShell: React.FC = () => {
   const {
     isAuthenticated,
+    authInitializing,
     accountTier,
     simulateDefensiveCash,
     isSandbox,
@@ -146,6 +147,17 @@ const SirixTerminalShell: React.FC = () => {
       .then((res) => setDeepDive(res))
       .finally(() => setLoadingDeepDive(false));
   }, [isAuthenticated, selectedTicker, accountTier]);
+
+  if (authInitializing) {
+    return (
+      <div className="min-h-screen sirix-canvas flex items-center justify-center">
+        <div className="flex items-center gap-2.5 text-xs font-mono-tabular text-[var(--text-secondary)]">
+          <RefreshCw className="w-4 h-4 text-[var(--accent-brand)] animate-spin" />
+          <span>Syncing SIRIX session...</span>
+        </div>
+      </div>
+    );
+  }
 
   if (!isAuthenticated) {
     return <LoginScreen />;
