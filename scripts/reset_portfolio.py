@@ -36,8 +36,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.api_exporter import (
-    CloudTelemetryExporter,
     PRIMARY_SIRIX_USER_ID,
+    SirixCloudExporter,
     StateStorageAdapter,
     UserPreferencesContract,
 )
@@ -548,9 +548,9 @@ def execute_portfolio_epoch_reset(
         primary_ledger = updated_portfolios.get(DEFAULT_ADMIN_PORTFOLIO_ID) or next(
             iter(updated_portfolios.values())
         )
-        exporter = CloudTelemetryExporter(storage=storage_adapter, market_repo=market_repo)
+        exporter = SirixCloudExporter(storage_adapter=storage_adapter, market_repo=market_repo)
         for uid in MANAGED_TENANT_USER_IDS:
-            exporter.export_portfolio_contracts(
+            exporter.export_all(
                 ledger=primary_ledger,
                 user_id=uid,
                 as_of_date=as_of,
