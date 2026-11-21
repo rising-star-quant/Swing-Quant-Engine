@@ -106,7 +106,7 @@ jobs:
       # Runtime environment & secrets injected safely into Cloud Run
       TARGET_ENVIRONMENT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'production' }}
       MIN_INSTANCES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.min_instances || '0' }}
-      SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
+      SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || vars.GCS_BUCKET_NAME || secrets.SIRIX_GCS_BUCKET || secrets.GCS_BUCKET_NAME || 'sirix-quant-state-prod' }}
       JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
       INTERNAL_SCHEDULER_TOKEN: ${{ secrets.INTERNAL_SCHEDULER_TOKEN }}
       SIRIX_DEFAULT_PASSWORD: ${{ secrets.SIRIX_DEFAULT_PASSWORD }}

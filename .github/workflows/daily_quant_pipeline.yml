@@ -96,8 +96,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
-          SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
-          GCS_BUCKET_NAME: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
+          SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || vars.GCS_BUCKET_NAME || secrets.SIRIX_GCS_BUCKET || secrets.GCS_BUCKET_NAME || 'sirix-quant-state-prod' }}
+          GCS_BUCKET_NAME: ${{ vars.SIRIX_GCS_BUCKET || vars.GCS_BUCKET_NAME || secrets.SIRIX_GCS_BUCKET || secrets.GCS_BUCKET_NAME || 'sirix-quant-state-prod' }}
           INTERNAL_SCHEDULER_TOKEN: ${{ secrets.INTERNAL_SCHEDULER_TOKEN }}
           SIRIX_CLOUD_RUN_URL: ${{ vars.SIRIX_CLOUD_RUN_URL || secrets.SIRIX_CLOUD_RUN_URL }}
           RESET_PORTFOLIO: ${{ github.event.inputs.reset_portfolio == 'true' && 'true' || 'false' }}
@@ -192,25 +192,48 @@ jobs:
       - name: Gate 3 — Atomic Virtual Ledger Persistence Commit
         if: ${{ success() && github.event.inputs.dry_run != 'true' }}
         run: |
+          set -euo pipefail
           git config --local user.name "github-actions[bot]"
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          if [ -f "data/virtual_portfolio.json" ]; then
-            git add data/virtual_portfolio.json
+          if [ ! -f "data/virtual_portfolio.json" ]; then
+            echo "No data/virtual_portfolio.json file present."
+            exit 0
           fi
 
-          if git diff --staged --quiet; then
-            echo "No changes to data/virtual_portfolio.json detected."
-          else
-            COMMIT_DATE="${{ github.event.inputs.target_date }}"
-            if [ -z "$COMMIT_DATE" ]; then
-              COMMIT_DATE="$(date -u +'%Y-%m-%d')"
+          STAGE_FILE="$(mktemp)"
+          trap 'rm -f "${STAGE_FILE}"' EXIT
+          cp -p "data/virtual_portfolio.json" "${STAGE_FILE}"
+
+          COMMIT_DATE="${{ github.event.inputs.target_date }}"
+          if [ -z "$COMMIT_DATE" ]; then
+            COMMIT_DATE="$(date -u +'%Y-%m-%d')"
+          fi
+
+          for attempt in 1 2 3; do
+            git fetch origin "${GITHUB_REF_NAME}" --depth=1
+            git reset --hard FETCH_HEAD
+            mkdir -p data
+            cp -p "${STAGE_FILE}" "data/virtual_portfolio.json"
+            git add data/virtual_portfolio.json
+
+            if git diff --staged --quiet; then
+              echo "No changes to data/virtual_portfolio.json detected."
+              break
             fi
+
             if [ "${{ github.event.inputs.reset_portfolio }}" = "true" ]; then
-              git commit -m "chore(ledger): operator portfolio baseline reset to $100,000.00 & kill-switch re-armed (${COMMIT_DATE}) [skip ci]"
+              git commit -m "chore(ledger): operator portfolio baseline reset to \$100,000.00 & kill-switch re-armed (${COMMIT_DATE}) [skip ci]"
             else
               git commit -m "chore(ledger): atomic EOD virtual portfolio update (${COMMIT_DATE}) [skip ci]"
             fi
-            git pull --rebase origin "${GITHUB_REF_NAME}"
-            git push origin HEAD:"${GITHUB_REF_NAME}"
-          fi
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              break
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "::error::Failed to push virtual portfolio update after 3 attempts."
+              exit 1
+            fi
+            echo "Remote branch updated concurrently (attempt ${attempt}/3); retrying on latest HEAD..."
+            sleep 2
+          done

@@ -94,8 +94,8 @@ jobs:
           ENVIRONMENT: production
           DRY_RUN: 'false'
           JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
-          SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
-          GCS_BUCKET_NAME: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
+          SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || vars.GCS_BUCKET_NAME || secrets.SIRIX_GCS_BUCKET || secrets.GCS_BUCKET_NAME || 'sirix-quant-state-prod' }}
+          GCS_BUCKET_NAME: ${{ vars.SIRIX_GCS_BUCKET || vars.GCS_BUCKET_NAME || secrets.SIRIX_GCS_BUCKET || secrets.GCS_BUCKET_NAME || 'sirix-quant-state-prod' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SIRIX_CLOUD_RUN_URL: ${{ vars.SIRIX_CLOUD_RUN_URL || secrets.SIRIX_CLOUD_RUN_URL }}
@@ -109,42 +109,69 @@ jobs:
       - name: Commit Synchronized Epoch & State Artifacts to Git ([skip ci])
         if: ${{ success() }}
         run: |
+          set -euo pipefail
           git config --local user.name "github-actions[bot]"
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          for f in \
-            data/virtual_portfolio.json \
-            data/eod_heartbeat.json \
-            data/state.json \
-            data/portfolio_epochs.json \
-            data/equity_history.json \
-            data/trade_history.json \
-            data/state/virtual_portfolio.json \
-            data/state/state.json \
-            data/state/portfolio_epochs.json \
-            data/state/equity_history.json \
-            data/state/equity_curve.json \
-            data/state/trade_history.json \
-            data/state/eod_telemetry.json \
-            data/state/eod_heartbeat.json; do
+          STATE_FILES=(
+            data/virtual_portfolio.json
+            data/eod_heartbeat.json
+            data/state.json
+            data/portfolio_epochs.json
+            data/equity_history.json
+            data/trade_history.json
+            data/state/virtual_portfolio.json
+            data/state/state.json
+            data/state/portfolio_epochs.json
+            data/state/equity_history.json
+            data/state/equity_curve.json
+            data/state/trade_history.json
+            data/state/eod_telemetry.json
+            data/state/eod_heartbeat.json
+          )
+
+          STAGE_DIR="$(mktemp -d)"
+          trap 'rm -rf "${STAGE_DIR}"' EXIT
+          for f in "${STATE_FILES[@]}"; do
             if [ -f "$f" ]; then
-              git add "$f"
+              mkdir -p "${STAGE_DIR}/$(dirname "$f")"
+              cp -p "$f" "${STAGE_DIR}/$f"
             fi
           done
 
-          if git diff --staged --quiet; then
-            echo "No local Git ledger diffs to commit (GCS remains Single Source of Truth)."
-          else
-            UTC_STAMP="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          UTC_STAMP="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          for attempt in 1 2 3; do
+            git fetch origin "${GITHUB_REF_NAME}" --depth=1
+            git reset --hard FETCH_HEAD
+            for f in "${STATE_FILES[@]}"; do
+              if [ -f "${STAGE_DIR}/$f" ]; then
+                mkdir -p "$(dirname "$f")"
+                cp -p "${STAGE_DIR}/$f" "$f"
+                git add "$f"
+              fi
+            done
+
+            if git diff --staged --quiet; then
+              echo "No local Git ledger diffs to commit (GCS remains Single Source of Truth)."
+              break
+            fi
+
             git commit -m "chore(epoch): hard portfolio epoch reset '${EPOCH_ALIAS}' to \$100,000.00 (${UTC_STAMP}) [skip ci]"
-            git pull --rebase origin "${GITHUB_REF_NAME}"
-            git push origin HEAD:"${GITHUB_REF_NAME}"
-          fi
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              break
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "::error::Failed to push synchronized state artifacts after 3 attempts."
+              exit 1
+            fi
+            echo "Remote branch updated concurrently (attempt ${attempt}/3); retrying on latest HEAD..."
+            sleep 2
+          done
 
       - name: Publish Epoch Reset Summary
         if: ${{ success() }}
         env:
-          SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
+          SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || vars.GCS_BUCKET_NAME || secrets.SIRIX_GCS_BUCKET || secrets.GCS_BUCKET_NAME || 'sirix-quant-state-prod' }}
         run: |
           python - <<'PY'
           import json
