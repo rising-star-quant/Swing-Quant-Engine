@@ -27,11 +27,12 @@ jobs:
     timeout-minutes: 20
     env:
       GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
       EPOCH_ALIAS: ${{ github.event.inputs.epoch_alias }}
       CONFIRM_RESET: ${{ github.event.inputs.confirm_reset }}
 
     steps:
-      - name: Pre-Flight Double-Confirmation Guard (Fail Fast Before GCS Access)
+      - name: Pre-Flight Double-Confirmation & Credential Guard (Fail Fast Before GCS Access)
         run: |
           if [ "${CONFIRM_RESET}" != "RESET" ]; then
             echo "::error::Hard Epoch Reset aborted: confirm_reset MUST equal 'RESET' exactly (received '${CONFIRM_RESET}'). Zero changes made to GCS."
@@ -42,7 +43,17 @@ jobs:
             echo "::error::Hard Epoch Reset aborted: epoch_alias must be at least 3 characters long."
             exit 1
           fi
-          echo "Pre-flight confirmation verified. Proceeding to Hard Epoch Reset for alias: ${TRIMMED_ALIAS}"
+          WIF_PROVIDER="${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}"
+          WIF_SA="${{ vars.GCP_SERVICE_ACCOUNT }}"
+          if { [ -z "${WIF_PROVIDER}" ] || [ -z "${WIF_SA}" ]; } && [ -z "${GCP_SA_KEY}" ]; then
+            echo "::error::Hard Epoch Reset aborted: Missing Google Cloud credentials. Configure Workload Identity Federation (both vars.GCP_WORKLOAD_IDENTITY_PROVIDER and vars.GCP_SERVICE_ACCOUNT) or secrets.GCP_SA_KEY."
+            exit 1
+          fi
+          if [ -z "${JWT_SECRET_KEY}" ]; then
+            echo "::error::Hard Epoch Reset aborted: Missing secrets.JWT_SECRET_KEY (>= 32 chars required in production)."
+            exit 1
+          fi
+          echo "Pre-flight confirmation & credentials verified. Proceeding to Hard Epoch Reset for alias: ${TRIMMED_ALIAS}"
 
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -129,3 +140,35 @@ jobs:
             git pull --rebase origin "${GITHUB_REF_NAME}"
             git push origin HEAD:"${GITHUB_REF_NAME}"
           fi
+
+      - name: Publish Epoch Reset Summary
+        if: ${{ success() }}
+        env:
+          SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          state_path = Path("data/state/state.json")
+          state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              lines = [
+                  "## SIRIX Controlled Portfolio Epoch Reset (E.1) Complete",
+                  "",
+                  "| Field | Value |",
+                  "| :--- | :--- |",
+                  f"| **Active Epoch** | `Epoch #{state.get('epoch_id', '?')}` — {state.get('epoch_alias', '')} |",
+                  f"| **State Revision ID** | `{state.get('state_revision_id', 'unknown')}` |",
+                  f"| **Cash / Equity** | `${state.get('cash_balance', 100000.0):,.2f}` |",
+                  f"| **Open Positions** | `{state.get('open_positions_count', 0)}` |",
+                  f"| **Portfolio Heat** | `{state.get('portfolio_heat_pct', 0.0):.2f}%` |",
+                  f"| **Kill-Switch Status** | `{state.get('kill_switch_status', 'ARMED_READY')}` |",
+                  f"| **GCS Bucket** | `{os.environ.get('SIRIX_GCS_BUCKET', '')}` |",
+                  f"| **Timestamp (UTC)** | `{state.get('last_updated_utc', '')}` |",
+              ]
+              with open(summary_path, "a", encoding="utf-8") as fh:
+                  fh.write("\n".join(lines) + "\n")
+          PY

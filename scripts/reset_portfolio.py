@@ -111,16 +111,55 @@ def validate_reset_inputs(epoch_alias: str, confirm_reset: str) -> str:
         )
     if not EPOCH_ALIAS_PATTERN.match(cleaned_alias):
         raise EpochResetValidationError(
-            "epoch_alias may only contain alphanumeric characters, spaces, and safe punctuation (._:/-)."
+            "epoch_alias must start and end with an alphanumeric character and may only contain "
+            "alphanumeric characters, spaces, and safe punctuation (._:/-)."
         )
     return cleaned_alias
+
+
+def _load_stored_mtm_prices(storage_adapter: StateStorageAdapter) -> Dict[str, float]:
+    """
+    Loads the last recorded EOD mark-to-market `current_price` for active tickers
+    from GCS/local `positions_detail.json` and `portfolio_state.json` so stateless
+    CI runners without local Parquet caches still liquidate at real latest EOD prices.
+    """
+    prices: Dict[str, float] = {}
+    positions_detail = storage_adapter.read_user_json(PRIMARY_SIRIX_USER_ID, "positions_detail.json")
+    if isinstance(positions_detail, dict):
+        for ticker, payload in positions_detail.items():
+            if isinstance(payload, dict):
+                try:
+                    px = float(payload.get("current_price", 0.0))
+                    if px > 0.0:
+                        prices[str(ticker).strip().upper()] = round(px, 4)
+                except (TypeError, ValueError):
+                    continue
+
+    portfolio_state = storage_adapter.read_user_json(PRIMARY_SIRIX_USER_ID, "portfolio_state.json")
+    if isinstance(portfolio_state, dict) and isinstance(portfolio_state.get("holdings"), list):
+        for item in portfolio_state["holdings"]:
+            if isinstance(item, dict) and item.get("ticker"):
+                tk = str(item["ticker"]).strip().upper()
+                if tk not in prices:
+                    try:
+                        px = float(item.get("current_price", 0.0))
+                        if px > 0.0:
+                            prices[tk] = round(px, 4)
+                    except (TypeError, ValueError):
+                        continue
+    return prices
 
 
 def _resolve_mark_to_market_price(
     pos: TripleBarrierPositionSchema,
     market_repo: ParquetMarketDataRepository,
+    stored_mtm_prices: Optional[Dict[str, float]] = None,
 ) -> float:
-    """Fetches latest Close from Parquet cache, falling back to last recorded high/entry price."""
+    """
+    Fetches latest Close from Parquet cache, falling back to last stored EOD
+    Mark-to-Market price in GCS state (`positions_detail.json` / `portfolio_state.json`),
+    and finally to `entry_price` if no market snapshot is available.
+    """
     try:
         df_latest = market_repo.load_ohlcv(pos.ticker, lookback_days=1)
         if df_latest is not None and not df_latest.empty:
@@ -129,8 +168,13 @@ def _resolve_mark_to_market_price(
                 return round(close_val, 4)
     except Exception as exc:
         logger.debug("Parquet mark-to-market fallback for %s: %s", pos.ticker, exc)
-    fallback_price = max(float(pos.entry_price), float(pos.highest_high_since_entry) * 0.985)
-    return round(fallback_price, 4)
+
+    if stored_mtm_prices:
+        stored_px = stored_mtm_prices.get(pos.ticker.strip().upper())
+        if stored_px is not None and stored_px > 0.0:
+            return round(float(stored_px), 4)
+
+    return round(float(pos.entry_price), 4)
 
 
 def _compute_continuous_twr(
@@ -225,6 +269,14 @@ def execute_portfolio_epoch_reset(
         local_data_dir=(resolved_settings.base_dir / "data"),
     )
 
+    # Fail fast in production if a GCS bucket is configured but credentials/client are unavailable
+    if not dry_run and resolved_settings.environment == "production" and bucket_name:
+        if gcs_reader._get_gcs_client() is None:
+            raise RuntimeError(
+                f"CRITICAL: Production Epoch Reset requires live GCS access to bucket '{bucket_name}', "
+                "but the GCS client failed to initialize. Verify GCP_SA_KEY or Workload Identity Federation."
+            )
+
     # Load existing epochs store & active portfolio state (GCS-first, local fallback)
     raw_epochs_doc, _ = gcs_reader.read_portfolio_epochs()
     epochs_store = PortfolioEpochsStoreSchema.model_validate(raw_epochs_doc)
@@ -241,6 +293,8 @@ def execute_portfolio_epoch_reset(
     if not current_state.tenant_portfolios:
         current_state = json_repo.load_or_initialize_state(as_of_date=as_of)
 
+    stored_mtm_prices = _load_stored_mtm_prices(storage_adapter)
+
     # -------------------------------------------------------------------------
     # STEP 1: Isolated Pre-Reset Backup Snapshot (GCS + Local)
     # -------------------------------------------------------------------------
@@ -254,11 +308,20 @@ def execute_portfolio_epoch_reset(
         "state/trade_history.json",
         "state/eod_telemetry.json",
         "state/eod_heartbeat.json",
-        f"users/{PRIMARY_SIRIX_USER_ID}/portfolio_state.json",
-        f"users/{PRIMARY_SIRIX_USER_ID}/positions_detail.json",
-        f"users/{PRIMARY_SIRIX_USER_ID}/audit_log.json",
-        f"users/{PRIMARY_SIRIX_USER_ID}/preferences.json",
+        "state.json",
+        "portfolio_epochs.json",
+        "equity_history.json",
+        "trade_history.json",
     ]
+    for uid in MANAGED_TENANT_USER_IDS:
+        objects_to_backup.extend(
+            [
+                f"users/{uid}/portfolio_state.json",
+                f"users/{uid}/positions_detail.json",
+                f"users/{uid}/audit_log.json",
+                f"users/{uid}/preferences.json",
+            ]
+        )
     backed_up_gcs_keys: List[str] = []
     if not dry_run:
         backed_up_gcs_keys = gcs_reader.backup_objects_in_gcs(backup_prefix, objects_to_backup)
@@ -290,7 +353,7 @@ def execute_portfolio_epoch_reset(
         ledger_closed_trades = list(ledger.closed_trades_audit)
 
         for ticker, pos in sorted(ledger.open_positions.items()):
-            exit_price = _resolve_mark_to_market_price(pos, market_repo)
+            exit_price = _resolve_mark_to_market_price(pos, market_repo, stored_mtm_prices)
             proceeds = round(exit_price * pos.shares, 2)
             liquidated_proceeds += proceeds
             realized_pnl = round((exit_price - pos.entry_price) * pos.shares, 2)
@@ -355,10 +418,14 @@ def execute_portfolio_epoch_reset(
         if rec.epoch_id == old_epoch_id:
             prior_found = True
             prior_starting_equity = float(rec.starting_equity)
-            prior_return_pct = round(
-                ((closing_equity_before_reset - prior_starting_equity) / prior_starting_equity)
-                * 100.0,
-                4,
+            prior_return_pct = (
+                round(
+                    ((closing_equity_before_reset - prior_starting_equity) / prior_starting_equity)
+                    * 100.0,
+                    4,
+                )
+                if prior_starting_equity > 0.0
+                else 0.0
             )
             updated_epoch_records.append(
                 rec.model_copy(
@@ -373,9 +440,13 @@ def execute_portfolio_epoch_reset(
         else:
             updated_epoch_records.append(rec)
 
-    closed_epoch_return_pct = round(
-        ((closing_equity_before_reset - prior_starting_equity) / prior_starting_equity) * 100.0,
-        4,
+    closed_epoch_return_pct = (
+        round(
+            ((closing_equity_before_reset - prior_starting_equity) / prior_starting_equity) * 100.0,
+            4,
+        )
+        if prior_starting_equity > 0.0
+        else 0.0
     )
     if not prior_found:
         updated_epoch_records.append(
@@ -520,6 +591,10 @@ def execute_portfolio_epoch_reset(
         "state_revision_id": new_state_revision_id,
     }
 
+    storage_backend_used = "DRY_RUN"
+    telegram_dispatched = False
+    cache_invalidated = False
+
     if not dry_run:
         # Persist root & state/* JSON artifacts with Layer 1 no-cache headers
         json_repo.save_state(reset_state_store)
@@ -529,14 +604,22 @@ def execute_portfolio_epoch_reset(
         state_rev_payload = state_revision_doc.model_dump(mode="json")
         vp_payload = json.loads(reset_state_store.model_dump_json())
 
-        gcs_reader.write_json_atomically("state/virtual_portfolio.json", vp_payload)
-        gcs_reader.write_json_atomically("state/state.json", state_rev_payload)
-        gcs_reader.write_json_atomically("state/portfolio_epochs.json", epochs_payload)
-        gcs_reader.write_json_atomically("state/equity_history.json", normalized_history)
-        gcs_reader.write_json_atomically("state/equity_curve.json", normalized_history)
-        gcs_reader.write_json_atomically("state/trade_history.json", trade_history_list)
-        gcs_reader.write_json_atomically("state/eod_telemetry.json", telemetry_payload)
-        gcs_reader.write_json_atomically("state/eod_heartbeat.json", telemetry_payload)
+        write_backends = [
+            gcs_reader.write_json_atomically("state/virtual_portfolio.json", vp_payload),
+            gcs_reader.write_json_atomically("state/state.json", state_rev_payload),
+            gcs_reader.write_json_atomically("state/portfolio_epochs.json", epochs_payload),
+            gcs_reader.write_json_atomically("state/equity_history.json", normalized_history),
+            gcs_reader.write_json_atomically("state/equity_curve.json", normalized_history),
+            gcs_reader.write_json_atomically("state/trade_history.json", trade_history_list),
+            gcs_reader.write_json_atomically("state/eod_telemetry.json", telemetry_payload),
+            gcs_reader.write_json_atomically("state/eod_heartbeat.json", telemetry_payload),
+        ]
+        storage_backend_used = "GCS" if all(b == "GCS" for b in write_backends) else "LOCAL_FALLBACK"
+        if resolved_settings.environment == "production" and bucket_name and storage_backend_used != "GCS":
+            raise RuntimeError(
+                f"CRITICAL: Production Epoch Reset expected GCS persistence to '{bucket_name}', "
+                f"but fell back to '{storage_backend_used}'."
+            )
 
         # Also mirror root-level E.1 paths in GCS & local data/ for direct contract reads
         storage_adapter.write_root_json("state.json", state_rev_payload)
@@ -579,7 +662,7 @@ def execute_portfolio_epoch_reset(
         # STEP 6: Dispatch Structured Telegram Alert via NotificationHub
         # ---------------------------------------------------------------------
         hub = NotificationHub(settings=resolved_settings)
-        hub.dispatch_epoch_reset_summary(
+        telegram_dispatched = hub.dispatch_epoch_reset_summary(
             closed_epoch_id=old_epoch_id,
             closed_epoch_alias=old_epoch_alias,
             closing_equity_before_reset=closing_equity_before_reset,
@@ -595,13 +678,15 @@ def execute_portfolio_epoch_reset(
         )
 
         # Layer 2 Cloud Run Cache Invalidation Webhook
-        _trigger_cloud_run_invalidation(
+        cache_invalidated = _trigger_cloud_run_invalidation(
             cloud_run_url=os.environ.get("SIRIX_CLOUD_RUN_URL", ""),
             scheduler_token=os.environ.get("INTERNAL_SCHEDULER_TOKEN", ""),
         )
 
     summary = {
         "status": "DRY_RUN_VALIDATED" if dry_run else "EPOCH_RESET_COMPLETED",
+        "storage_backend": storage_backend_used,
+        "gcs_objects_backed_up": len(backed_up_gcs_keys),
         "closed_epoch_id": old_epoch_id,
         "closed_epoch_alias": old_epoch_alias,
         "closing_equity_before_reset": closing_equity_before_reset,
@@ -615,6 +700,8 @@ def execute_portfolio_epoch_reset(
         "cumulative_algo_return_pct": continuous_twr_pct,
         "state_revision_id": new_state_revision_id,
         "backup_prefix": backup_prefix,
+        "telegram_dispatched": telegram_dispatched,
+        "cache_invalidated": cache_invalidated,
         "reset_timestamp_utc": reset_iso_utc,
     }
     logger.info("E.1 Portfolio Epoch Reset Summary:\n%s", json.dumps(summary, indent=2))
