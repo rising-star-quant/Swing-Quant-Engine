@@ -5,6 +5,7 @@ import {
   ShieldCheck,
   Sliders,
   AlertOctagon,
+  AlertTriangle,
   Lock,
   Check,
   FlaskConical,
@@ -38,6 +39,7 @@ export const PreferencesView: React.FC = () => {
   } = usePreferences();
   const {
     accountTier,
+    isSandbox,
     switchTier,
     simulateDefensiveCash,
     toggleDefensiveCash,
@@ -57,6 +59,7 @@ export const PreferencesView: React.FC = () => {
     preferences.guardrails.active_universes
   );
   const [savedBanner, setSavedBanner] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [confirmingKillSwitch, setConfirmingKillSwitch] = useState(false);
 
   const isExpert = accountTier === 'EXPERT';
@@ -73,24 +76,52 @@ export const PreferencesView: React.FC = () => {
     }
   };
 
+  const handleLanguageChange = async (code: SupportedLanguage) => {
+    setSaveError(null);
+    try {
+      await setLanguage(code);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Failed to persist language preference.');
+    }
+  };
+
+  const handleThemeChange = async (nextTheme: SupportedTheme) => {
+    setSaveError(null);
+    try {
+      await setTheme(nextTheme);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Failed to persist theme preference.');
+    }
+  };
+
   const handleSaveGuardrails = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!isExpert) return;
-    await updateGuardrails({
-      max_portfolio_heat_pct: maxHeat,
-      risk_per_trade_pct: riskPerTrade,
-      time_barrier_days: timeBarrierDays,
-      earnings_blackout_days: blackoutDays,
-      active_universes: universes,
-    });
-    setSavedBanner(true);
-    setTimeout(() => setSavedBanner(false), 3000);
+    setSaveError(null);
+    try {
+      await updateGuardrails({
+        max_portfolio_heat_pct: maxHeat,
+        risk_per_trade_pct: riskPerTrade,
+        time_barrier_days: timeBarrierDays,
+        earnings_blackout_days: blackoutDays,
+        active_universes: universes,
+      });
+      setSavedBanner(true);
+      setTimeout(() => setSavedBanner(false), 3000);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Failed to persist risk guardrails.');
+    }
   };
 
   const handleKillSwitchToggle = async (activate: boolean) => {
     if (!isExpert) return;
-    await updateGuardrails({ kill_switch_active: activate });
-    setConfirmingKillSwitch(false);
+    setSaveError(null);
+    try {
+      await updateGuardrails({ kill_switch_active: activate });
+      setConfirmingKillSwitch(false);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Failed to update kill-switch state.');
+    }
   };
 
   return (
@@ -105,53 +136,68 @@ export const PreferencesView: React.FC = () => {
         </p>
       </div>
 
-      {/* Interactive Sandbox Tier & Edge-State Controls */}
-      <section className="rounded-2xl border border-[var(--accent-brand)] bg-[var(--bg-surface)] p-5 space-y-4">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex items-center gap-2">
-            <FlaskConical className="w-4 h-4 text-[var(--accent-brand)]" />
-            <h2 className="text-sm font-bold text-[var(--text-primary)]">
-              {t.preferences.demoTierSwitcherTitle}
-            </h2>
+      {saveError && (
+        <div
+          role="alert"
+          className="rounded-xl border border-[var(--semantic-crimson)] bg-[var(--semantic-crimson-subtle)] p-4 flex items-start gap-2.5 text-xs text-[var(--semantic-crimson)]"
+        >
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div className="space-y-0.5">
+            <div className="font-semibold">Live Preferences Update Failed</div>
+            <p className="text-[var(--text-primary)]">{saveError}</p>
           </div>
-          <span
-            dir="ltr"
-            className="text-xs font-mono-tabular px-2 py-0.5 rounded bg-[var(--accent-brand-subtle)] text-[var(--accent-brand)] font-semibold"
-          >
-            ACTIVE TIER: {accountTier}
-          </span>
         </div>
-        <p className="text-xs text-[var(--text-secondary)]">{t.preferences.demoTierSwitcherDesc}</p>
+      )}
 
-        <div className="flex flex-wrap items-center justify-between gap-4 pt-1">
-          <div className="flex items-center gap-2">
-            {(['FREE', 'PRO', 'EXPERT'] as AccountTier[]).map((tier) => (
-              <button
-                key={tier}
-                type="button"
-                onClick={() => switchTier(tier)}
-                className={`px-3.5 py-2 rounded-xl text-xs font-mono-tabular font-semibold border transition-all cursor-pointer ${
-                  accountTier === tier
-                    ? 'border-[var(--accent-brand)] bg-[var(--accent-brand)] text-slate-950'
-                    : 'border-[var(--border-subtle)] bg-[var(--bg-canvas)] text-[var(--text-secondary)] hover:border-[var(--border-strong)]'
-                }`}
-              >
-                {tier}
-              </button>
-            ))}
+      {/* Interactive Sandbox Tier & Edge-State Controls (Explicit Dev Sandbox Only) */}
+      {isSandbox && (
+        <section className="rounded-2xl border border-[var(--accent-brand)] bg-[var(--bg-surface)] p-5 space-y-4">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <FlaskConical className="w-4 h-4 text-[var(--accent-brand)]" />
+              <h2 className="text-sm font-bold text-[var(--text-primary)]">
+                {t.preferences.demoTierSwitcherTitle}
+              </h2>
+            </div>
+            <span
+              dir="ltr"
+              className="text-xs font-mono-tabular px-2 py-0.5 rounded bg-[var(--accent-brand-subtle)] text-[var(--accent-brand)] font-semibold"
+            >
+              ACTIVE TIER: {accountTier}
+            </span>
           </div>
+          <p className="text-xs text-[var(--text-secondary)]">{t.preferences.demoTierSwitcherDesc}</p>
 
-          <label className="inline-flex items-center gap-2.5 text-xs text-[var(--text-primary)] cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={simulateDefensiveCash}
-              onChange={(e) => toggleDefensiveCash(e.target.checked)}
-              className="w-4 h-4 accent-[var(--accent-brand)] rounded cursor-pointer"
-            />
-            <span>{t.preferences.simulateDefensiveCash}</span>
-          </label>
-        </div>
-      </section>
+          <div className="flex flex-wrap items-center justify-between gap-4 pt-1">
+            <div className="flex items-center gap-2">
+              {(['FREE', 'PRO', 'EXPERT'] as AccountTier[]).map((tier) => (
+                <button
+                  key={tier}
+                  type="button"
+                  onClick={() => switchTier(tier)}
+                  className={`px-3.5 py-2 rounded-xl text-xs font-mono-tabular font-semibold border transition-all cursor-pointer ${
+                    accountTier === tier
+                      ? 'border-[var(--accent-brand)] bg-[var(--accent-brand)] text-slate-950'
+                      : 'border-[var(--border-subtle)] bg-[var(--bg-canvas)] text-[var(--text-secondary)] hover:border-[var(--border-strong)]'
+                  }`}
+                >
+                  {tier}
+                </button>
+              ))}
+            </div>
+
+            <label className="inline-flex items-center gap-2.5 text-xs text-[var(--text-primary)] cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={simulateDefensiveCash}
+                onChange={(e) => toggleDefensiveCash(e.target.checked)}
+                className="w-4 h-4 accent-[var(--accent-brand)] rounded cursor-pointer"
+              />
+              <span>{t.preferences.simulateDefensiveCash}</span>
+            </label>
+          </div>
+        </section>
+      )}
 
       {/* 1. Multilingual Localization & RTL/LTR Switcher */}
       <section className="rounded-2xl border sirix-surface p-5 space-y-4">
@@ -170,7 +216,7 @@ export const PreferencesView: React.FC = () => {
               <button
                 key={opt.code}
                 type="button"
-                onClick={() => setLanguage(opt.code)}
+                onClick={() => void handleLanguageChange(opt.code)}
                 className={`p-3 rounded-xl border text-left transition-all flex items-center justify-between cursor-pointer ${
                   active
                     ? 'border-[var(--accent-brand)] bg-[var(--accent-brand-subtle)]'
@@ -236,7 +282,7 @@ export const PreferencesView: React.FC = () => {
               <button
                 key={swatch.id}
                 type="button"
-                onClick={() => setTheme(swatch.id)}
+                onClick={() => void handleThemeChange(swatch.id)}
                 className={`p-4 rounded-xl border text-left transition-all flex flex-col justify-between cursor-pointer ${
                   active
                     ? 'border-[var(--accent-brand)] bg-[var(--accent-brand-subtle)]'
@@ -305,13 +351,15 @@ export const PreferencesView: React.FC = () => {
               <Lock className="w-4 h-4 text-[var(--accent-brand)] shrink-0" />
               <span>{t.preferences.expertRequiredBanner}</span>
             </div>
-            <button
-              type="button"
-              onClick={() => switchTier('EXPERT')}
-              className="shrink-0 px-3 py-1.5 rounded-lg bg-[var(--accent-brand)] text-slate-950 font-semibold text-xs cursor-pointer"
-            >
-              Switch to EXPERT Tier
-            </button>
+            {isSandbox && (
+              <button
+                type="button"
+                onClick={() => switchTier('EXPERT')}
+                className="shrink-0 px-3 py-1.5 rounded-lg bg-[var(--accent-brand)] text-slate-950 font-semibold text-xs cursor-pointer"
+              >
+                Switch to EXPERT Tier
+              </button>
+            )}
           </div>
         )}
 

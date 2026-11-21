@@ -10,6 +10,7 @@ import {
   Database,
   RefreshCw,
   Flag,
+  AlertTriangle,
   X,
 } from 'lucide-react';
 import {
@@ -49,10 +50,11 @@ const SirixTerminalShell: React.FC = () => {
   const [equityHistory, setEquityHistory] = useState<EquityHistoryPoint[]>([]);
   const [epochs, setEpochs] = useState<PortfolioEpochRecord[]>([]);
   const [loadingOverview, setLoadingOverview] = useState<boolean>(true);
+  const [apiError, setApiError] = useState<string | null>(null);
   const [forceSyncing, setForceSyncing] = useState<boolean>(false);
   const [epochToast, setEpochToast] = useState<EpochChangeEvent | null>(null);
 
-  const [selectedTicker, setSelectedTicker] = useState<string | null>('CELH');
+  const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
   const [deepDive, setDeepDive] = useState<PositionDeepDiveResponse | null>(null);
   const [loadingDeepDive, setLoadingDeepDive] = useState<boolean>(false);
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState<boolean>(false);
@@ -60,10 +62,11 @@ const SirixTerminalShell: React.FC = () => {
 
   const killSwitchActive = preferences.guardrails.kill_switch_active;
 
-  // Fetch Portfolio Overview + E.1 Epochs & Continuous TWR Equity History
+  // Fetch Portfolio Overview + E.1 Epochs & Continuous TWR Equity History (fail-loud, zero mock fallback)
   const fetchOverview = useCallback(
     async (forceBust = false) => {
       setLoadingOverview(true);
+      setApiError(null);
       try {
         const [data, epochsRes, historyRes] = await Promise.all([
           sirixClient.getPortfolioOverview(killSwitchActive, forceBust),
@@ -81,6 +84,12 @@ const SirixTerminalShell: React.FC = () => {
           setSelectedTicker(null);
           setDeepDive(null);
         }
+      } catch (err) {
+        const message =
+          err instanceof Error
+            ? err.message
+            : `Failed to fetch live portfolio state from ${sirixClient.getApiOriginDisplay()}.`;
+        setApiError(message);
       } finally {
         setLoadingOverview(false);
       }
@@ -94,7 +103,7 @@ const SirixTerminalShell: React.FC = () => {
     setForceSyncing(true);
     try {
       sirixClient.clearLocalCache();
-      await Promise.all([refreshPreferences(), fetchOverview(true)]);
+      await Promise.allSettled([refreshPreferences(), fetchOverview(true)]);
     } finally {
       setForceSyncing(false);
     }
@@ -102,7 +111,7 @@ const SirixTerminalShell: React.FC = () => {
 
   useEffect(() => {
     if (isAuthenticated) {
-      fetchOverview(false);
+      void fetchOverview(false);
     }
   }, [isAuthenticated, accountTier, simulateDefensiveCash, killSwitchActive, fetchOverview]);
 
@@ -115,7 +124,7 @@ const SirixTerminalShell: React.FC = () => {
       setEquityHistory([]);
       setEpochs([]);
       setEpochToast(event);
-      void refreshPreferences();
+      void refreshPreferences().catch(() => undefined);
       void fetchOverview(true);
     });
     return unsubscribe;
@@ -141,11 +150,33 @@ const SirixTerminalShell: React.FC = () => {
       setDeepDive(null);
       return;
     }
+    let active = true;
     setLoadingDeepDive(true);
     sirixClient
       .getPositionDeepDive(selectedTicker)
-      .then((res) => setDeepDive(res))
-      .finally(() => setLoadingDeepDive(false));
+      .then((res) => {
+        if (active) {
+          setDeepDive(res);
+        }
+      })
+      .catch((err) => {
+        if (active) {
+          setDeepDive(null);
+          setApiError(
+            err instanceof Error
+              ? err.message
+              : `Unable to load live position deep dive for ${selectedTicker}.`
+          );
+        }
+      })
+      .finally(() => {
+        if (active) {
+          setLoadingDeepDive(false);
+        }
+      });
+    return () => {
+      active = false;
+    };
   }, [isAuthenticated, selectedTicker, accountTier]);
 
   if (authInitializing) {
@@ -271,7 +302,7 @@ const SirixTerminalShell: React.FC = () => {
             >
               {isSandbox ? (
                 <>
-                  <Database className="w-3 h-3 text-[var(--accent-brand)]" />
+                  <Database className="w-3 h-3 text-[var(--semantic-amber)]" />
                   <span>{t.header.sandboxMode}</span>
                 </>
               ) : (
@@ -283,27 +314,36 @@ const SirixTerminalShell: React.FC = () => {
             </span>
           </div>
 
-          {/* Right Quick Tier Switcher & Audit Button */}
+          {/* Right Tier Indicator (Switcher in explicit sandbox only), Force Sync & Audit Button */}
           <div className="flex items-center gap-2">
-            <div
-              dir="ltr"
-              className="inline-flex items-center rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-canvas)] p-0.5"
-            >
-              {(['FREE', 'PRO', 'EXPERT'] as AccountTier[]).map((tier) => (
-                <button
-                  key={tier}
-                  type="button"
-                  onClick={() => switchTier(tier)}
-                  className={`px-2 py-1 rounded-md text-[10px] font-mono-tabular font-semibold transition-all cursor-pointer ${
-                    accountTier === tier
-                      ? 'bg-[var(--accent-brand)] text-slate-950'
-                      : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
-                  }`}
-                >
-                  {tier}
-                </button>
-              ))}
-            </div>
+            {isSandbox ? (
+              <div
+                dir="ltr"
+                className="inline-flex items-center rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-canvas)] p-0.5"
+              >
+                {(['FREE', 'PRO', 'EXPERT'] as AccountTier[]).map((tier) => (
+                  <button
+                    key={tier}
+                    type="button"
+                    onClick={() => switchTier(tier)}
+                    className={`px-2 py-1 rounded-md text-[10px] font-mono-tabular font-semibold transition-all cursor-pointer ${
+                      accountTier === tier
+                        ? 'bg-[var(--accent-brand)] text-slate-950'
+                        : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                    }`}
+                  >
+                    {tier}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <span
+                dir="ltr"
+                className="px-2.5 py-1 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-canvas)] text-[10px] font-mono-tabular font-semibold text-[var(--accent-brand)]"
+              >
+                {accountTier}
+              </span>
+            )}
 
             <button
               type="button"
@@ -330,6 +370,42 @@ const SirixTerminalShell: React.FC = () => {
             </button>
           </div>
         </header>
+
+        {/* Live API Diagnostic Error Banner (Fail-Loud — Never Masks Errors with Mock Data) */}
+        {apiError && (
+          <div
+            role="alert"
+            className="mx-4 sm:mx-6 mt-3 rounded-xl border border-[var(--semantic-crimson)] bg-[var(--semantic-crimson-subtle)] px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs"
+          >
+            <div className="flex items-start gap-2.5 text-[var(--semantic-crimson)] min-w-0">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+              <div className="space-y-0.5 min-w-0">
+                <div className="font-semibold">
+                  Live SIRIX Backend Telemetry Sync Failed ({sirixClient.getApiOriginDisplay()})
+                </div>
+                <div className="text-[var(--text-primary)] break-words">{apiError}</div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleForceSync}
+                disabled={forceSyncing}
+                className="px-3 py-1.5 rounded-lg bg-[var(--semantic-crimson)] text-white font-semibold cursor-pointer disabled:opacity-60"
+              >
+                Retry Live Sync
+              </button>
+              <button
+                type="button"
+                onClick={() => setApiError(null)}
+                aria-label="Dismiss API error banner"
+                className="p-1 rounded-md text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* E.1 Layer 4 New Epoch Toast Banner */}
         {epochToast && (

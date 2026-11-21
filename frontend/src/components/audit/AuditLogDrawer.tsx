@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { X, Download, Lock, History, CheckCircle2 } from 'lucide-react';
+import React, { useEffect, useState, useCallback } from 'react';
+import { X, Download, Lock, History, CheckCircle2, AlertTriangle } from 'lucide-react';
 import { AuditLogResponse, ClosedTradeRecord, ExitReasonCode } from '../../types/sirix';
 import { sirixClient } from '../../api/client';
 import { usePreferences } from '../../context/PreferencesContext';
@@ -51,18 +51,32 @@ function getExitReasonBadgeStyle(reason: ExitReasonCode): {
 
 export const AuditLogDrawer: React.FC<AuditLogDrawerProps> = ({ open, onClose }) => {
   const { t, language } = usePreferences();
-  const { accountTier, switchTier } = useAuth();
+  const { accountTier, isSandbox, switchTier } = useAuth();
   const [audit, setAudit] = useState<AuditLogResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!open) return;
+  const loadAuditLog = useCallback(() => {
     setLoading(true);
+    setLoadError(null);
     sirixClient
       .getAuditLog()
       .then((res) => setAudit(res))
+      .catch((err) => {
+        setAudit(null);
+        setLoadError(
+          err instanceof Error
+            ? err.message
+            : `Failed to fetch live closed-trade audit log from ${sirixClient.getApiOriginDisplay()}.`
+        );
+      })
       .finally(() => setLoading(false));
-  }, [open, accountTier]);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    loadAuditLog();
+  }, [open, accountTier, loadAuditLog]);
 
   if (!open) return null;
 
@@ -146,7 +160,7 @@ export const AuditLogDrawer: React.FC<AuditLogDrawerProps> = ({ open, onClose })
                 <Download className="w-3.5 h-3.5" />
                 <span>{t.audit.exportCsvBtn}</span>
               </button>
-            ) : (
+            ) : isSandbox ? (
               <button
                 type="button"
                 onClick={() => switchTier('EXPERT')}
@@ -155,6 +169,11 @@ export const AuditLogDrawer: React.FC<AuditLogDrawerProps> = ({ open, onClose })
                 <Lock className="w-3 h-3 text-[var(--accent-brand)]" />
                 <span>{t.audit.exportExpertOnly}</span>
               </button>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-canvas)] text-[var(--text-muted)] text-xs">
+                <Lock className="w-3 h-3 text-[var(--accent-brand)]" />
+                <span>{t.audit.exportExpertOnly}</span>
+              </span>
             )}
 
             <button
@@ -169,7 +188,27 @@ export const AuditLogDrawer: React.FC<AuditLogDrawerProps> = ({ open, onClose })
 
         {/* Scrollable Body */}
         <div className="flex-1 overflow-y-auto p-5 space-y-4">
-          {loading || !audit ? (
+          {loadError ? (
+            <div
+              role="alert"
+              className="rounded-xl border border-[var(--semantic-crimson)] bg-[var(--semantic-crimson-subtle)] p-4 space-y-3 text-xs"
+            >
+              <div className="flex items-start gap-2 text-[var(--semantic-crimson)]">
+                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <div className="font-semibold">Unable to Load Live Audit Ledger</div>
+                  <p className="text-[var(--text-primary)]">{loadError}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={loadAuditLog}
+                className="px-3 py-1.5 rounded-lg bg-[var(--semantic-crimson)] text-white font-semibold cursor-pointer"
+              >
+                Retry Audit Fetch
+              </button>
+            </div>
+          ) : loading || !audit ? (
             <div className="space-y-3 animate-pulse">
               <div className="h-20 rounded-xl sirix-surface border" />
               <div className="h-28 rounded-xl sirix-surface border" />
@@ -311,13 +350,15 @@ export const AuditLogDrawer: React.FC<AuditLogDrawerProps> = ({ open, onClose })
                   <span className="text-[var(--text-secondary)]">
                     {t.audit.freeTruncationNote}
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => switchTier('PRO')}
-                    className="shrink-0 px-3 py-1.5 rounded-lg bg-[var(--accent-brand)] text-slate-950 font-semibold cursor-pointer"
-                  >
-                    Unlock Full History
-                  </button>
+                  {isSandbox && (
+                    <button
+                      type="button"
+                      onClick={() => switchTier('PRO')}
+                      className="shrink-0 px-3 py-1.5 rounded-lg bg-[var(--accent-brand)] text-slate-950 font-semibold cursor-pointer"
+                    >
+                      Unlock Full History
+                    </button>
+                  )}
                 </div>
               )}
             </>

@@ -237,7 +237,7 @@ export const PositionInspector: React.FC<PositionInspectorProps> = ({
   onClose,
 }) => {
   const { t, language } = usePreferences();
-  const { switchTier } = useAuth();
+  const { isSandbox, switchTier } = useAuth();
 
   if (loading || !deepDive) {
     return (
@@ -358,13 +358,15 @@ export const PositionInspector: React.FC<PositionInspectorProps> = ({
             <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
               {t.inspector.lockedTelemetryDesc}
             </p>
-            <button
-              type="button"
-              onClick={() => switchTier('PRO')}
-              className="px-3 py-1.5 rounded-md bg-[var(--accent-brand)] text-slate-950 font-semibold text-xs cursor-pointer"
-            >
-              Unlock PRO Telemetry
-            </button>
+            {isSandbox && (
+              <button
+                type="button"
+                onClick={() => switchTier('PRO')}
+                className="px-3 py-1.5 rounded-md bg-[var(--accent-brand)] text-slate-950 font-semibold text-xs cursor-pointer"
+              >
+                Unlock PRO Telemetry
+              </button>
+            )}
           </div>
         ) : (
           <>

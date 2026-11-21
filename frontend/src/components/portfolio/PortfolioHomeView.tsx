@@ -90,7 +90,7 @@ export const PortfolioHomeView: React.FC<PortfolioHomeViewProps> = ({
   onOpenAuditLog,
 }) => {
   const { t, language } = usePreferences();
-  const { switchTier } = useAuth();
+  const { isSandbox, switchTier } = useAuth();
 
   // CLS = 0 Geometry-Matched Skeleton Loader
   if (loading || !overview) {
@@ -489,13 +489,15 @@ export const PortfolioHomeView: React.FC<PortfolioHomeViewProps> = ({
               {t.portfolio.freeTierBannerSubtitle}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => switchTier('PRO')}
-            className="shrink-0 px-3.5 py-2 rounded-lg bg-[var(--accent-brand)] text-slate-950 font-semibold text-xs hover:opacity-95 transition-opacity cursor-pointer"
-          >
-            {t.portfolio.upgradeToProCta}
-          </button>
+          {isSandbox && (
+            <button
+              type="button"
+              onClick={() => switchTier('PRO')}
+              className="shrink-0 px-3.5 py-2 rounded-lg bg-[var(--accent-brand)] text-slate-950 font-semibold text-xs hover:opacity-95 transition-opacity cursor-pointer"
+            >
+              {t.portfolio.upgradeToProCta}
+            </button>
+          )}
         </div>
       )}
 

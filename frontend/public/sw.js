@@ -1,4 +1,4 @@
-const STATIC_CACHE_NAME = 'sirix-static-cache-v2';
+const STATIC_CACHE_NAME = 'sirix-static-cache-v3';
 const STATIC_ASSETS = ['/', '/index.html', '/manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {

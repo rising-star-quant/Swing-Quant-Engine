@@ -1,12 +1,13 @@
 import React, { useState } from 'react';
 import { ShieldCheck, Lock, Sparkles, ArrowRight } from 'lucide-react';
 import { AccountTier } from '../../types/sirix';
+import { sirixClient } from '../../api/client';
 import { useAuth } from '../../context/AuthContext';
 import { usePreferences } from '../../context/PreferencesContext';
 import { TermTooltip } from '../common/TermTooltip';
 
 export const LoginScreen: React.FC = () => {
-  const { login, enterSandbox } = useAuth();
+  const { login, enterSandbox, isSandboxAllowed } = useAuth();
   const { t, language } = usePreferences();
   const [email, setEmail] = useState('trader@sirix.quant');
   const [password, setPassword] = useState('');
@@ -51,7 +52,7 @@ export const LoginScreen: React.FC = () => {
           </span>
         </div>
 
-        {/* Tier Selector for Instant Demo / Auth Testing */}
+        {/* Account Tier Email Preset Selector */}
         <div className="mb-6 p-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-canvas)]">
           <div className="text-xs font-medium text-[var(--text-secondary)] mb-2">
             Select Telemetry Access Tier:
@@ -128,34 +129,49 @@ export const LoginScreen: React.FC = () => {
           <button
             type="submit"
             disabled={loading}
-            className="w-full py-2.5 px-4 rounded-lg bg-[var(--accent-brand)] text-slate-950 font-semibold text-sm flex items-center justify-center gap-2 hover:opacity-95 transition-opacity cursor-pointer"
+            className="w-full py-2.5 px-4 rounded-lg bg-[var(--accent-brand)] text-slate-950 font-semibold text-sm flex items-center justify-center gap-2 hover:opacity-95 transition-opacity cursor-pointer disabled:opacity-60"
           >
             <span>{t.auth.signInBtn}</span>
             <ArrowRight className="w-4 h-4" />
           </button>
         </form>
 
-        <div className="my-4 flex items-center gap-3">
-          <div className="h-px flex-1 bg-[var(--border-subtle)]" />
-          <span className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">OR</span>
-          <div className="h-px flex-1 bg-[var(--border-subtle)]" />
-        </div>
+        {isSandboxAllowed && (
+          <>
+            <div className="my-4 flex items-center gap-3">
+              <div className="h-px flex-1 bg-[var(--border-subtle)]" />
+              <span className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
+                DEV SANDBOX ONLY
+              </span>
+              <div className="h-px flex-1 bg-[var(--border-subtle)]" />
+            </div>
 
-        <button
-          type="button"
-          onClick={() => enterSandbox(selectedTier)}
-          className="w-full py-2.5 px-4 rounded-lg border border-[var(--border-strong)] bg-[var(--bg-canvas)] hover:bg-[var(--bg-surface-hover)] text-xs font-medium text-[var(--text-primary)] transition-colors cursor-pointer"
-        >
-          {t.auth.sandboxBtn} ({selectedTier})
-        </button>
+            <button
+              type="button"
+              onClick={() => enterSandbox(selectedTier)}
+              className="w-full py-2.5 px-4 rounded-lg border border-[var(--border-strong)] bg-[var(--bg-canvas)] hover:bg-[var(--bg-surface-hover)] text-xs font-medium text-[var(--text-primary)] transition-colors cursor-pointer"
+            >
+              {t.auth.sandboxBtn} ({selectedTier})
+            </button>
+          </>
+        )}
 
-        {/* Zero-Override Institutional Notice */}
-        <div className="mt-6 pt-4 border-t border-[var(--border-subtle)] flex items-center justify-between text-xs text-[var(--text-muted)]">
-          <span className="inline-flex items-center gap-1.5">
-            <ShieldCheck className="w-4 h-4 text-[var(--semantic-emerald)] shrink-0" />
-            <TermTooltip term="Zero-Override" language={language} />
-          </span>
-          <span className="text-[11px]">{t.auth.zeroOverridePromise.split('•')[1]}</span>
+        {/* Zero-Override Notice & Resolved Live API Endpoint */}
+        <div className="mt-6 pt-4 border-t border-[var(--border-subtle)] space-y-2">
+          <div className="flex items-center justify-between text-xs text-[var(--text-muted)]">
+            <span className="inline-flex items-center gap-1.5">
+              <ShieldCheck className="w-4 h-4 text-[var(--semantic-emerald)] shrink-0" />
+              <TermTooltip term="Zero-Override" language={language} />
+            </span>
+            <span className="text-[11px]">{t.auth.zeroOverridePromise.split('•')[1]}</span>
+          </div>
+          <div
+            dir="ltr"
+            className="text-[10px] font-mono-tabular text-[var(--text-muted)] truncate text-center"
+            title={sirixClient.getApiOriginDisplay()}
+          >
+            API Target: {sirixClient.getApiOriginDisplay()}
+          </div>
         </div>
       </div>
     </div>

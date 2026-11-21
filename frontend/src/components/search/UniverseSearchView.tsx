@@ -7,6 +7,7 @@ import {
   Lock,
   Sparkles,
   Filter,
+  AlertTriangle,
 } from 'lucide-react';
 import { TickerSearchResult } from '../../types/sirix';
 import { sirixClient } from '../../api/client';
@@ -19,42 +20,51 @@ interface UniverseSearchViewProps {
 }
 
 const QUICK_SAMPLE_TICKERS = [
-  { ticker: 'DUOL', tag: 'Stage 2 • Earnings Blackout' },
-  { ticker: 'MSTR', tag: 'Stage 3 • Choppiness Filter' },
-  { ticker: 'CAVA', tag: 'Heat Cap • Queued #1' },
-  { ticker: 'CELH', tag: 'Held in Portfolio' },
-  { ticker: 'FN', tag: 'Held in Portfolio' },
+  { ticker: 'DUOL', tag: 'MID' },
+  { ticker: 'MSTR', tag: 'MID' },
+  { ticker: 'CAVA', tag: 'MID' },
+  { ticker: 'CELH', tag: 'MID' },
+  { ticker: 'FN', tag: 'RUT' },
 ];
 
 export const UniverseSearchView: React.FC<UniverseSearchViewProps> = ({
   onInspectHeldTicker,
 }) => {
   const { t, language } = usePreferences();
-  const { accountTier, switchTier } = useAuth();
+  const { accountTier, isSandbox, switchTier } = useAuth();
   const [query, setQuery] = useState('DUOL');
   const [result, setResult] = useState<TickerSearchResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
 
   const runSearch = async (tickerToSearch: string) => {
     const cleaned = tickerToSearch.trim().toUpperCase();
     if (!cleaned) return;
     setLoading(true);
+    setSearchError(null);
     try {
       const res = await sirixClient.searchUniverseTicker(cleaned);
       setResult(res);
+    } catch (err) {
+      setResult(null);
+      setSearchError(
+        err instanceof Error
+          ? err.message
+          : `Failed to query live screening ledger for ${cleaned}.`
+      );
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    runSearch(query);
+    void runSearch(query);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountTier]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    runSearch(query);
+    void runSearch(query);
   };
 
   return (
@@ -89,7 +99,7 @@ export const UniverseSearchView: React.FC<UniverseSearchViewProps> = ({
           <button
             type="submit"
             disabled={loading}
-            className="px-5 py-2.5 rounded-xl bg-[var(--accent-brand)] text-slate-950 font-semibold text-sm hover:opacity-95 transition-opacity cursor-pointer"
+            className="px-5 py-2.5 rounded-xl bg-[var(--accent-brand)] text-slate-950 font-semibold text-sm hover:opacity-95 transition-opacity cursor-pointer disabled:opacity-60"
           >
             {t.search.searchButton}
           </button>
@@ -104,7 +114,7 @@ export const UniverseSearchView: React.FC<UniverseSearchViewProps> = ({
               type="button"
               onClick={() => {
                 setQuery(item.ticker);
-                runSearch(item.ticker);
+                void runSearch(item.ticker);
               }}
               className={`px-2.5 py-1 rounded-lg border text-xs font-mono-tabular transition-colors cursor-pointer ${
                 result?.query_ticker === item.ticker
@@ -120,6 +130,20 @@ export const UniverseSearchView: React.FC<UniverseSearchViewProps> = ({
           ))}
         </div>
       </section>
+
+      {/* Live Search Error Banner */}
+      {searchError && (
+        <div
+          role="alert"
+          className="rounded-xl border border-[var(--semantic-crimson)] bg-[var(--semantic-crimson-subtle)] p-4 flex items-start gap-2.5 text-xs text-[var(--semantic-crimson)]"
+        >
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div className="space-y-1">
+            <div className="font-semibold">Live Universe Search Failed</div>
+            <p className="text-[var(--text-primary)]">{searchError}</p>
+          </div>
+        </div>
+      )}
 
       {/* 2. Search Verdict Card */}
       {loading && (
@@ -236,13 +260,15 @@ export const UniverseSearchView: React.FC<UniverseSearchViewProps> = ({
                     {t.search.proGateLockedDesc}
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => switchTier('PRO')}
-                  className="shrink-0 px-3.5 py-2 rounded-lg bg-[var(--accent-brand)] text-slate-950 font-semibold text-xs cursor-pointer"
-                >
-                  Unlock PRO Gate Metrics
-                </button>
+                {isSandbox && (
+                  <button
+                    type="button"
+                    onClick={() => switchTier('PRO')}
+                    className="shrink-0 px-3.5 py-2 rounded-lg bg-[var(--accent-brand)] text-slate-950 font-semibold text-xs cursor-pointer"
+                  >
+                    Unlock PRO Gate Metrics
+                  </button>
+                )}
               </div>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">

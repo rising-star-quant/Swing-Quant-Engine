@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 try:
@@ -343,7 +344,21 @@ def create_app(
         redoc_url=None,
     )
 
-    # Deliberately ZERO CORSMiddleware: strict Single-Origin architecture.
+    # Default: ZERO CORSMiddleware (strict Single-Origin Cloud Run architecture).
+    # Opt-in split-origin CORS ONLY when SIRIX_CORS_ORIGINS is explicitly configured.
+    raw_cors_origins = os.environ.get("SIRIX_CORS_ORIGINS", "").strip()
+    if raw_cors_origins:
+        allowed_origins = [origin.strip() for origin in raw_cors_origins.split(",") if origin.strip()]
+        if allowed_origins:
+            fastapi_app.add_middleware(
+                CORSMiddleware,
+                allow_origins=allowed_origins,
+                allow_credentials=True,
+                allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+                allow_headers=["*"],
+                expose_headers=["X-SIRIX-Epoch-ID", "X-SIRIX-State-Rev"],
+            )
+
     fastapi_app.state.settings = resolved_settings
     fastapi_app.state.state_reader = resolved_reader
     fastapi_app.state.session_manager = resolved_sessions

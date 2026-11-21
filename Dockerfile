@@ -1,6 +1,14 @@
 # Stage 1: Build React / PWA Frontend Assets
 FROM node:20-slim AS frontend-builder
 
+ARG VITE_API_URL=""
+ARG VITE_API_BASE_URL=""
+ARG VITE_ENABLE_SANDBOX="false"
+
+ENV VITE_API_URL=${VITE_API_URL} \
+    VITE_API_BASE_URL=${VITE_API_BASE_URL} \
+    VITE_ENABLE_SANDBOX=${VITE_ENABLE_SANDBOX}
+
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm install --no-audit --no-fund
