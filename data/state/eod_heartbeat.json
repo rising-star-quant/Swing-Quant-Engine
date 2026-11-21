@@ -1,9 +1,9 @@
 {
   "eod_status": "IDLE",
-  "last_successful_eod_timestamp": "2026-11-19T21:11:03.980390Z",
-  "last_updated_utc": "2026-11-19T21:11:03.980390Z",
-  "last_trading_date_processed": "2026-11-19",
-  "trading_date": "2026-11-19",
+  "last_successful_eod_timestamp": "2026-11-21T22:49:53.703025Z",
+  "last_updated_utc": "2026-11-21T22:49:53.703025Z",
+  "last_trading_date_processed": "2026-11-21",
+  "trading_date": "2026-11-21",
   "current_portfolio_heat_pct": 0.0,
   "portfolio_heat_pct": 0.0,
   "open_positions_count": 0,
@@ -11,7 +11,7 @@
   "cash_balance": 100000.0,
   "kill_switch_status": "ARMED_READY",
   "kill_switch_active": false,
-  "epoch_id": 3,
+  "epoch_id": 4,
   "epoch_alias": "New Start",
-  "state_revision_id": "epoch_3_20261119T211103Z"
+  "state_revision_id": "epoch_4_20261121T224953Z"
 }

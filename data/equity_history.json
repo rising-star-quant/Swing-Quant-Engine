@@ -2,10 +2,24 @@
   {
     "date": "2026-11-19",
     "raw_portfolio_value": 100000.0,
+    "portfolio_nav": 100000.0,
     "cumulative_algo_return_pct": 0.0,
-    "epoch_id": 3,
+    "epoch_id": 2,
     "epoch_marker": {
-      "epoch_id": 3,
+      "epoch_id": 2,
+      "alias": "New Start"
+    },
+    "heat_pct": 0.0,
+    "benchmark_iwm_norm": 100.0,
+    "benchmark_mdy_norm": 100.0
+  },
+  {
+    "date": "2026-11-21",
+    "raw_portfolio_value": 100000.0,
+    "cumulative_algo_return_pct": 0.0,
+    "epoch_id": 4,
+    "epoch_marker": {
+      "epoch_id": 4,
       "alias": "New Start"
     },
     "heat_pct": 0.0,
