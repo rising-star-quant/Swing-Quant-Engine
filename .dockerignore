@@ -1,0 +1,46 @@
+# Version control & CI/CD
+.git
+.gitignore
+.github
+.aistudio
+
+# Secrets & local environment files (never bake secrets into container layers)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Node / Frontend caches & build outputs (rebuilt cleanly in Stage 1)
+node_modules
+frontend/node_modules
+frontend/dist
+dist
+build
+coverage
+bun.lock
+
+# Python caches, virtualenvs & test artifacts
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+tests
+
+# Documentation, design specs & large binary/media assets
+docs
+public/assets
+README.md
+*.md
+
+# Local market data caches & pre-reset backup snapshots (GCS is Single Source of Truth)
+data/ohlcv_parquet
+data/cache
+data/backups
+*.parquet
+*.log
+.DS_Store

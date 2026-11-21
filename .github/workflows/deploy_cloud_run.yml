@@ -1,34 +1,334 @@
-name: Deploy FastAPI to Cloud Run
+name: SIRIX — Build & Deploy Single-Origin Platform to Cloud Run
 
 on:
   push:
     branches:
       - main
-    paths:
-      - 'api/**'          # הנתיב של תיקיית ה-FastAPI שלך
-      - 'src/**'
-      - 'Dockerfile'
-      - 'requirements.txt'
+    paths-ignore:
+      - 'data/**'
+      - 'docs/**'
+      - 'public/assets/**'
+      - '**/*.md'
+      - '.github/workflows/daily_quant_pipeline.yml'
+      - '.github/workflows/reset_portfolio.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target runtime environment for Cloud Run container'
+        required: true
+        type: choice
+        default: production
+        options:
+          - production
+          - sandbox
+      min_instances:
+        description: 'Minimum Cloud Run instances (0 = Scale-to-Zero free tier, 1 = always warm)'
+        required: true
+        type: choice
+        default: '0'
+        options:
+          - '0'
+          - '1'
+      skip_tests:
+        description: 'Emergency override: skip pre-deploy frontend build and pytest contract gates'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: sirix-cloud-run-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
-  deploy:
+  pre-deploy-verify:
+    name: Pre-Deploy Frontend & API Contract Verification
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.skip_tests != 'true' }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set Up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Verify React / PWA Production Build
+        run: |
+          npm --prefix frontend install --no-audit --no-fund
+          npm --prefix frontend run build
+
+      - name: Set Up Python 3.11 with Pip Cache
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-api.txt
+
+      - name: Install Python API & Test Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-api.txt
+
+      - name: Run API Syntax & Contract Verification Suite
+        env:
+          PYTHONPATH: .
+          ENVIRONMENT: test
+          DRY_RUN: 'true'
+        run: |
+          python -m py_compile api/main.py src/api.py src/api_exporter.py src/storage.py src/schemas.py src/config.py
+          pytest tests/test_api_contracts.py -v --tb=short
+
+  build-and-deploy:
+    name: Build Multi-Stage Container & Deploy to Google Cloud Run
+    needs: pre-deploy-verify
+    if: ${{ always() && (needs.pre-deploy-verify.result == 'success' || needs.pre-deploy-verify.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Auth & GCP target configuration (bound to env so steps[*].if never references secrets.*)
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      GCP_PROJECT_ID_VAR: ${{ vars.GCP_PROJECT_ID }}
+      GCP_PROJECT_ID_SECRET: ${{ secrets.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION || 'us-central1' }}
+      CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE || 'sirix-platform' }}
+      ARTIFACT_REGISTRY_REPO: ${{ vars.ARTIFACT_REGISTRY_REPO || 'sirix-containers' }}
+      CLOUD_RUN_RUNTIME_SA: ${{ vars.CLOUD_RUN_RUNTIME_SA }}
+      # Runtime environment & secrets injected safely into Cloud Run
+      TARGET_ENVIRONMENT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'production' }}
+      MIN_INSTANCES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.min_instances || '0' }}
+      SIRIX_GCS_BUCKET: ${{ vars.SIRIX_GCS_BUCKET || secrets.SIRIX_GCS_BUCKET || 'sirix-quant-state-prod' }}
+      JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
+      INTERNAL_SCHEDULER_TOKEN: ${{ secrets.INTERNAL_SCHEDULER_TOKEN }}
+      SIRIX_DEFAULT_PASSWORD: ${{ secrets.SIRIX_DEFAULT_PASSWORD }}
+      ADMIN_PASSWORD_HASH: ${{ secrets.ADMIN_PASSWORD_HASH }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
-      - name: Checkout Code
+      - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Authenticate to Google Cloud
+      - name: Validate Google Cloud Authentication Configuration
+        run: |
+          WIF_PROVIDER="${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}"
+          WIF_SA="${{ vars.GCP_SERVICE_ACCOUNT }}"
+          if { [ -z "${WIF_PROVIDER}" ] || [ -z "${WIF_SA}" ]; } && [ -z "${GCP_SA_KEY}" ]; then
+            echo "::error::Missing Google Cloud credentials. Configure Workload Identity Federation (both vars.GCP_WORKLOAD_IDENTITY_PROVIDER and vars.GCP_SERVICE_ACCOUNT) or secrets.GCP_SA_KEY."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud via Workload Identity Federation (OIDC)
+        if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.GCP_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Authenticate to Google Cloud via Service Account Key (Fallback)
+        if: ${{ (vars.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || vars.GCP_SERVICE_ACCOUNT == '') && env.GCP_SA_KEY != '' }}
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Deploy to Cloud Run
-        uses: google-github-actions/deploy-cloudrun@v2
+      - name: Set Up Google Cloud SDK (gcloud)
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Resolve GCP Project ID & Ensure Artifact Registry Repository
+        id: gcp_meta
+        run: |
+          set -euo pipefail
+          PROJECT_ID="${GCP_PROJECT_ID_VAR:-${GCP_PROJECT_ID_SECRET:-}}"
+          if [ -z "${PROJECT_ID}" ]; then
+            PROJECT_ID="$(gcloud config get-value project 2>/dev/null || true)"
+          fi
+          if [ -z "${PROJECT_ID}" ] || [ "${PROJECT_ID}" = "(unset)" ]; then
+            echo "::error::Unable to resolve GCP_PROJECT_ID. Set vars.GCP_PROJECT_ID (or secrets.GCP_PROJECT_ID)."
+            exit 1
+          fi
+
+          gcloud config set project "${PROJECT_ID}" --quiet
+
+          if ! gcloud artifacts repositories describe "${ARTIFACT_REGISTRY_REPO}" \
+            --location="${GCP_REGION}" \
+            --project="${PROJECT_ID}" >/dev/null 2>&1; then
+            echo "Creating Artifact Registry Docker repository '${ARTIFACT_REGISTRY_REPO}' in ${GCP_REGION}..."
+            gcloud artifacts repositories create "${ARTIFACT_REGISTRY_REPO}" \
+              --repository-format=docker \
+              --location="${GCP_REGION}" \
+              --project="${PROJECT_ID}" \
+              --description="SIRIX Single-Origin FastAPI + React PWA container images"
+          fi
+
+          gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+
+          SHORT_SHA="$(echo "${GITHUB_SHA}" | cut -c1-12)"
+          IMAGE_BASE="${GCP_REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_REPO}/${CLOUD_RUN_SERVICE}"
+          echo "project_id=${PROJECT_ID}" >> "${GITHUB_OUTPUT}"
+          echo "image_tag=${IMAGE_BASE}:${SHORT_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "image_latest=${IMAGE_BASE}:latest" >> "${GITHUB_OUTPUT}"
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & Push Multi-Stage SIRIX Container Image
+        uses: docker/build-push-action@v6
         with:
-          service: YOUR_CLOUD_RUN_SERVICE_NAME   # שם השירות שלך ב-Cloud Run
-          region: YOUR_REGION                    # למשל us-central1 או me-west1
-          source: .
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.gcp_meta.outputs.image_tag }}
+            ${{ steps.gcp_meta.outputs.image_latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy Unified Single-Origin Service to Google Cloud Run
+        id: deploy
+        run: |
+          set -euo pipefail
+          set +x
+
+          PROJECT_ID="${{ steps.gcp_meta.outputs.project_id }}"
+          IMAGE_URI="${{ steps.gcp_meta.outputs.image_tag }}"
+
+          # Construct non-empty --update-env-vars payload without printing secret values to logs.
+          # Using --update-env-vars preserves any additional variables/secrets configured directly in Cloud Run.
+          ENV_PAIRS=(
+            "ENVIRONMENT=${TARGET_ENVIRONMENT}"
+            "DRY_RUN=false"
+            "SIRIX_GCS_BUCKET=${SIRIX_GCS_BUCKET}"
+            "GCS_BUCKET_NAME=${SIRIX_GCS_BUCKET}"
+            "SIRIX_COOKIE_SECURE=true"
+          )
+
+          if [ -n "${JWT_SECRET_KEY:-}" ]; then
+            ENV_PAIRS+=("JWT_SECRET_KEY=${JWT_SECRET_KEY}")
+            ENV_PAIRS+=("SIRIX_JWT_SECRET=${JWT_SECRET_KEY}")
+          fi
+          if [ -n "${INTERNAL_SCHEDULER_TOKEN:-}" ]; then
+            ENV_PAIRS+=("INTERNAL_SCHEDULER_TOKEN=${INTERNAL_SCHEDULER_TOKEN}")
+          fi
+          if [ -n "${SIRIX_DEFAULT_PASSWORD:-}" ]; then
+            ENV_PAIRS+=("SIRIX_DEFAULT_PASSWORD=${SIRIX_DEFAULT_PASSWORD}")
+          fi
+          if [ -n "${ADMIN_PASSWORD_HASH:-}" ]; then
+            ENV_PAIRS+=("ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH}")
+          fi
+          if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            ENV_PAIRS+=("TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}")
+          fi
+          if [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+            ENV_PAIRS+=("TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}")
+          fi
+
+          # Join with multi-char custom delimiter (^||^ avoids collisions with commas, $, =, or @ in secrets/hashes)
+          DELIM="||"
+          ENV_ARG="^${DELIM}^"
+          for i in "${!ENV_PAIRS[@]}"; do
+            if [ "${i}" -gt 0 ]; then
+              ENV_ARG+="${DELIM}"
+            fi
+            ENV_ARG+="${ENV_PAIRS[$i]}"
+          done
+
+          DEPLOY_ARGS=(
+            run deploy "${CLOUD_RUN_SERVICE}"
+            --project="${PROJECT_ID}"
+            --region="${GCP_REGION}"
+            --platform=managed
+            --image="${IMAGE_URI}"
+            --port=8080
+            --allow-unauthenticated
+            --ingress=all
+            --min-instances="${MIN_INSTANCES}"
+            --max-instances=2
+            --cpu=1
+            --memory=512Mi
+            --cpu-throttling
+            --timeout=60
+            --concurrency=80
+            --update-env-vars="${ENV_ARG}"
+            --quiet
+          )
+
+          if [ -n "${CLOUD_RUN_RUNTIME_SA:-}" ]; then
+            DEPLOY_ARGS+=(--service-account="${CLOUD_RUN_RUNTIME_SA}")
+          fi
+
+          gcloud "${DEPLOY_ARGS[@]}"
+
+          SERVICE_URL="$(gcloud run services describe "${CLOUD_RUN_SERVICE}" \
+            --project="${PROJECT_ID}" \
+            --region="${GCP_REGION}" \
+            --format='value(status.url)')"
+          LATEST_REVISION="$(gcloud run services describe "${CLOUD_RUN_SERVICE}" \
+            --project="${PROJECT_ID}" \
+            --region="${GCP_REGION}" \
+            --format='value(status.latestReadyRevisionName)')"
+
+          echo "service_url=${SERVICE_URL}" >> "${GITHUB_OUTPUT}"
+          echo "revision=${LATEST_REVISION}" >> "${GITHUB_OUTPUT}"
+          echo "Deployed ${CLOUD_RUN_SERVICE} revision ${LATEST_REVISION} at ${SERVICE_URL}"
+
+      - name: Post-Deploy Live Health, PWA & Zero-Trust Route Verification
+        run: |
+          set -euo pipefail
+          SERVICE_URL="${{ steps.deploy.outputs.service_url }}"
+
+          echo "1. Verifying /api/health..."
+          HEALTH_BODY="$(curl -fsS --retry 3 --retry-delay 5 "${SERVICE_URL}/api/health")"
+          echo "Health response: ${HEALTH_BODY}"
+          echo "${HEALTH_BODY}" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"'
+
+          echo "2. Verifying Single-Origin SPA shell (/)..."
+          ROOT_CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${SERVICE_URL}/")"
+          if [ "${ROOT_CODE}" != "200" ]; then
+            echo "::error::Expected HTTP 200 on /, received HTTP ${ROOT_CODE}"
+            exit 1
+          fi
+
+          echo "3. Verifying Service Worker (/sw.js)..."
+          SW_CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${SERVICE_URL}/sw.js")"
+          if [ "${SW_CODE}" != "200" ]; then
+            echo "::error::Expected HTTP 200 on /sw.js, received HTTP ${SW_CODE}"
+            exit 1
+          fi
+
+          echo "4. Verifying mounted /api/v1/portfolio/overview enforces Zero-Trust JWT auth (expect 401, not 404)..."
+          V1_CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${SERVICE_URL}/api/v1/portfolio/overview")"
+          if [ "${V1_CODE}" != "401" ]; then
+            echo "::error::Expected HTTP 401 on unauthenticated /api/v1/portfolio/overview, received HTTP ${V1_CODE}"
+            exit 1
+          fi
+
+          echo "All post-deploy Cloud Run verification checks passed."
+
+      - name: Publish Deployment Summary
+        if: ${{ always() && steps.deploy.outputs.service_url != '' }}
+        run: |
+          {
+            echo "## SIRIX Cloud Run Deployment Complete"
+            echo ""
+            echo "| Field | Value |"
+            echo "| :--- | :--- |"
+            echo "| **Service** | \`${CLOUD_RUN_SERVICE}\` |"
+            echo "| **Region** | \`${GCP_REGION}\` |"
+            echo "| **Revision** | \`${{ steps.deploy.outputs.revision }}\` |"
+            echo "| **Live URL** | ${{ steps.deploy.outputs.service_url }} |"
+            echo "| **Image** | \`${{ steps.gcp_meta.outputs.image_tag }}\` |"
+            echo "| **GCS Bucket** | \`${SIRIX_GCS_BUCKET}\` |"
+            echo "| **Min Instances** | \`${MIN_INSTANCES}\` (Scale-to-Zero when 0) |"
+            echo "| **Commit** | \`${GITHUB_SHA}\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"
