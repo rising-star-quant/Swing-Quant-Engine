@@ -1,9 +1,9 @@
 {
   "schema_version": "2.1.0",
-  "epoch_id": 4,
+  "epoch_id": 5,
   "epoch_alias": "New Start",
-  "state_revision_id": "epoch_4_20261121T224953Z",
-  "last_updated_utc": "2026-11-21T22:50:04.610493Z",
+  "state_revision_id": "epoch_5_20261121T232839Z",
+  "last_updated_utc": "2026-11-21T23:28:48.797927Z",
   "index_registry": {
     "RUT_2000": {
       "index_id": "RUT_2000",

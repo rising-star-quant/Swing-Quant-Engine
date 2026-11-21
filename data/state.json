@@ -1,8 +1,8 @@
 {
-  "state_revision_id": "epoch_4_20261121T224953Z",
-  "epoch_id": 4,
+  "state_revision_id": "epoch_5_20261121T232839Z",
+  "epoch_id": 5,
   "epoch_alias": "New Start",
-  "last_updated_utc": "2026-11-21T22:49:53.703025Z",
+  "last_updated_utc": "2026-11-21T23:28:39.577075Z",
   "cash_balance": 100000.0,
   "total_equity": 100000.0,
   "portfolio_heat_pct": 0.0,
